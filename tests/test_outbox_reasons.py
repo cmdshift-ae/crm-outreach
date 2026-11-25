@@ -277,3 +277,18 @@ def test_a_sent_email_says_what_happens_next_if_nobody_answers(client):
     sent = client.get("/api/outbox").json()["sent"]
     assert sent[0]["next_step"]["step"] == 2
     assert sent[0]["next_step"]["status"] == "pending_review"
+
+
+def test_a_rewrite_that_gets_no_answer_says_why(client, monkeypatch):
+    _, items = asyncio.run(_seed(client.db_path))
+
+    async def no_answer(self, prompt, **kw):
+        self.last_reply_empty = True
+        return None
+
+    monkeypatch.setattr(dash, "_resolve_config_file",
+                        lambda: Path(__file__).resolve().parent.parent / "harvey.yaml")
+    monkeypatch.setattr("harvey.brain.Brain.think_json", no_answer)
+    r = client.post(f"/api/outbox/{items[('ops', 1)]}/rewrite", json={})
+    assert r.status_code == 502
+    assert "didn't answer" in r.json()["message"]

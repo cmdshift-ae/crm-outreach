@@ -1239,10 +1239,10 @@ async def outbox_redraft(item_id: str, request: Request):
                             + (f" ({item['review_note']})" if item.get("review_note") else "") + ".")
             if steer:
                 told.append(steer)
-            out = await _rewrite(state, item, " ".join(told))
-            if not out:
-                return _refuse("The rewrite came back empty. Try again in a minute, "
-                               "or bring it back as it was and edit it.", 502)
+            try:
+                out = await _rewrite(state, item, " ".join(told))
+            except RewriteError as e:
+                return _refuse(str(e) + " You can also bring it back as it was and edit it.", 502)
             subject, text = out["subject"], out["body"]
         checked = text
         footer = _compliance_view()["footer"]
@@ -1283,7 +1283,25 @@ async def _rewrite(state, item: dict, instruction: str) -> dict | None:
         persona_role=config.persona.role,
         persona_tone=config.persona.tone,
     ) or ""
-    return await rewrite_draft(state, brain, dict(item), context, instruction, base)
+    try:
+        out = await rewrite_draft(state, brain, dict(item), context, instruction, base)
+    except Exception as e:
+        logger.warning("rewrite failed: %s: %s", type(e).__name__, e)
+        raise RewriteError(f"The rewrite failed ({type(e).__name__}: {str(e)[:200]}).")
+    if out:
+        return out
+    why = brain.paused_reason
+    if why:
+        raise RewriteError(f"{brain.provider_label} isn't available right now: {why}.")
+    if brain.last_reply_empty:
+        raise RewriteError(f"{brain.provider_label} didn't answer. It may be logged out, at its usage "
+                           "limit, or slow; check Usage, or try again in a minute.")
+    raise RewriteError(f"{brain.provider_label} answered, but not with a usable draft. Try again, "
+                       "or edit by hand.")
+
+
+class RewriteError(Exception):
+    """Why a rewrite gave nothing, in words for the reviewer."""
 
 
 @app.post("/api/outbox/{item_id}/rewrite")
@@ -1297,9 +1315,10 @@ async def outbox_rewrite(item_id: str, request: Request):
         item = await state.get_outbox_item(item_id)
         if not item or item.get("status") != "pending_review":
             return _refuse("Only drafts awaiting review can be rewritten.")
-        out = await _rewrite(state, dict(item), instruction)
-        if not out:
-            return _refuse("The rewrite came back empty. Try again in a minute, or edit by hand.", 502)
+        try:
+            out = await _rewrite(state, dict(item), instruction)
+        except RewriteError as e:
+            return _refuse(str(e), 502)
         return {"success": True, **out}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
