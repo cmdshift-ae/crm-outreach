@@ -2,7 +2,8 @@ let currentTab = 'today';
 let companyDrill = false;      // true while viewing a single company's contacts
 let _companies = [], _prospects = [], _campaigns = [];
 let _signals = null;           // last /api/signals payload, for the cohort builder
-let _desk = { items: [], i: 0 };
+// view: 'pending' (waiting for you) or 'rejected' (drafts you can bring back).
+let _desk = { items: [], i: 0, view: 'pending', pending: [], followups: [], rejected: [] };
 // Reject reasons and approve tags, from /api/outbox/review-options.
 let _review = null;
 
@@ -1615,7 +1616,17 @@ async function loadOutbox() {
   }
 
   const pending = data.pending || [];
-  _desk.items = pending;
+  _desk.pending = pending;
+  _desk.followups = data.followups || [];
+  _desk.rejected = data.rejected || [];
+  if (_desk.focus) {   // a draft just brought back: open it where it now waits
+    const inFollowups = _desk.followups.some(p => p.id === _desk.focus);
+    _desk.view = inFollowups ? 'followups' : 'pending';
+    const at = deskList(_desk.view).findIndex(p => p.id === _desk.focus);
+    if (at >= 0) _desk.i = at;
+    _desk.focus = null;
+  }
+  _desk.items = deskList(_desk.view);
   _desk.footer = data.footer || '';
   // Keep the desk on the draft being edited even if the list shifted.
   const editingAt = _desk.editing ? pending.findIndex(p => p.id === _desk.editing) : -1;
@@ -1624,15 +1635,15 @@ async function loadOutbox() {
     _desk.editing = null;
     _desk.unsaved = null;
   }
-  if (_desk.i >= pending.length) _desk.i = Math.max(0, pending.length - 1);
-  navCount('nav-outbox', pending.length);
+  if (_desk.i >= _desk.items.length) _desk.i = Math.max(0, _desk.items.length - 1);
+  navCount('nav-outbox', data.waiting_total != null ? data.waiting_total : pending.length);
 
   actions.innerHTML =
     (pending.length && !data.paused
       ? (pending.length > pending.filter(p => heldReason(p)).length
         ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()" ' +
-          'title="Emails Harvey held are left for you to approve one by one">Approve all ' +
-          (pending.length - pending.filter(p => heldReason(p)).length) + '</button>' : '') : '') +
+          'title="Approves every email waiting, follow-ups included. Emails Harvey held are left for you to approve one by one">Approve all ' +
+          (data.waiting_total != null ? data.waiting_total : pending.length) + '</button>' : '') : '') +
     (data.paused
       ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' +
         'Resume sending</button>'
@@ -1653,12 +1664,7 @@ async function loadOutbox() {
         '<p>' + escHtml(data.compliance_notice) + '</p></div></div>';
   }
 
-  desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
-    '<div class="card">' + emptyState(icon('check'), 'Nothing to review',
-      _sendingMode && _sendingMode.mode === 'autopilot'
-        ? 'Autopilot is on, so Harvey sends on its own. Anything it holds for you shows up here.'
-        : 'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') +
-    '</div>';
+  renderDeskArea();
 
   const table = (title, rows, cols) => {
     if (!rows || !rows.length) return '';
@@ -1680,6 +1686,8 @@ async function loadOutbox() {
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
       ['Sent', r => formatDate(r.sent_at), true],
+      ['If no reply', r => r.next_step ? 'Email ' + r.next_step.step + ': ' + seqStep(r.next_step)
+        : (r.kind === 'sequence' ? 'last email in the sequence' : ''), true],
     ]) +
     table('Didn\'t send', data.failed, [
       ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
@@ -1748,6 +1756,25 @@ const CONTACT_SOURCES = {
 };
 
 // What the draft is built on, so every claim can be checked against it.
+// One line per email in this person's sequence: what went, what waits, what's next.
+function seqStep(st) {
+  switch (st.status) {
+    case 'sent': return 'sent ' + formatDate(st.sent_at);
+    case 'pending_review': return 'waiting for you';
+    case 'approved': return 'approved, goes ' + formatDate(st.send_at) + ' at the earliest';
+    case 'sending': return 'sending now';
+    case 'rejected': return 'you rejected it';
+    case 'cancelled': return 'cancelled';
+    case 'failed': return 'didn\'t send';
+    default: return st.status;
+  }
+}
+function renderSequence(seq) {
+  if (!seq || seq.length < 2) return '';
+  return seq.map(st => '<div><b>Email ' + escHtml(String(st.step)) + '</b> &middot; ' +
+    escHtml(seqStep(st)) + '</div>').join('');
+}
+
 function renderDeskContext(ctx) {
   if (!ctx) return '';
   const row = (k, v) => v ? '<div class="k">' + k + '</div><div class="v">' + v + '</div>' : '';
@@ -1774,6 +1801,7 @@ function renderDeskContext(ctx) {
       ' <span class="muted">(how they were found, not a fact about them)</span>' : '') +
     row('Writer notes', escHtml(ctx.notes)) +
     row('Tagged', ctx.tag ? '<span class="tag">' + escHtml(tagLabel(ctx.tag)) + '</span>' : '') +
+    row('Sequence', renderSequence(ctx.sequence)) +
   '</div>';
 }
 
@@ -1889,6 +1917,105 @@ function heldReason(item) {
   return why.charAt(0).toUpperCase() + why.slice(1);
 }
 
+function deskList(view) {
+  return view === 'rejected' ? _desk.rejected : view === 'followups' ? _desk.followups : _desk.pending;
+}
+
+function deskViews() {
+  const tab = (view, label, n, title) =>
+    '<button class="desk-view' + (_desk.view === view ? ' on' : '') + '" title="' + title + '" ' +
+      'onclick="deskView(\'' + view + '\')">' + label + ' <span class="hint">' + n + '</span></button>';
+  return '<div class="desk-views">' +
+    tab('pending', 'First emails', _desk.pending.length, 'First emails and replies waiting for you') +
+    tab('followups', 'Follow-ups', _desk.followups.length,
+      'Emails 2, 3… They go out only after the email before them is sent and its gap has passed, and stop if anyone at the company replies') +
+    tab('rejected', 'Rejected', _desk.rejected.length, 'Drafts you rejected: draft one again from here') +
+    '</div>';
+}
+
+function renderDeskArea() {
+  const desk = document.getElementById('outbox-desk');
+  if (!desk) return;
+  let body;
+  if (_desk.items.length) body = renderDesk(_desk.items, _desk.i);
+  else if (_desk.view === 'rejected') {
+    body = '<div class="card">' + emptyState(icon('check'), 'Nothing rejected',
+      'Drafts you reject land here, with your reason, so you can draft one again.') + '</div>';
+  } else if (_desk.view === 'followups') {
+    body = '<div class="card">' + emptyState(icon('check'), 'No follow-ups waiting',
+      'Follow-ups are written with each first email. Any waiting for your approval show up here.') + '</div>';
+  } else {
+    body = '<div class="card">' + emptyState(icon('check'), 'Nothing to review',
+      _sendingMode && _sendingMode.mode === 'autopilot'
+        ? 'Autopilot is on, so Harvey sends on its own. Anything it holds for you shows up here.'
+        : 'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') + '</div>';
+  }
+  desk.innerHTML = deskViews() + body;
+}
+
+function deskView(view) {
+  if (view === _desk.view || deskBusy()) return;
+  _desk.view = view;
+  _desk.i = 0;
+  _desk.mode = null;
+  _desk.items = deskList(view);
+  renderDeskArea();
+}
+
+// A rejected draft: why you rejected it, and the ways back.
+function renderRejectedPane(cur) {
+  const why = cur.review_reason ? reasonLabel(cur.review_reason) : 'No reason given';
+  const busy = _desk.mode === 'rewriting';
+  return '<div class="banner bad desk-held">' + icon('alert') + '<div><b>You rejected this ' +
+      formatDate(cur.updated_at) + '</b><div>' + escHtml(why) +
+      (cur.review_note ? ': ' + escHtml(cur.review_note) : '') + '</div></div></div>' +
+    '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
+    '<div class="body">' + escHtml(cur.body) + '</div>' +
+    '<div class="desk-rewrite-again"><input id="desk-rw-note" class="form-input" ' +
+      'placeholder="Anything else for the new draft? (optional) Your reject note is used already." ' +
+      'onkeydown="if(event.key===\'Enter\'){event.preventDefault();deskRedraft(' + jsq(cur.id) + ',\'rewrite\')}"' +
+      (busy ? ' disabled' : '') + '></div>' +
+    '<div class="desk-actions">' +
+      (busy
+        ? '<span class="muted">Drafting it again in your style… this takes a few seconds.</span>'
+        : '<button class="btn btn-primary" onclick="deskRedraft(' + jsq(cur.id) + ',\'rewrite\')" ' +
+            'title="Writes it again in your style, told why you rejected it, and puts it back in Waiting for you">' +
+            'Draft again <kbd>D</kbd></button>' +
+          '<button class="btn btn-secondary" onclick="deskRedraft(' + jsq(cur.id) + ',\'as_is\')">' +
+            'Bring back as it was</button>' +
+          '<span class="muted" style="font-size:12px;margin-left:auto">Nothing is approved: it goes back to ' +
+            'Waiting for you. ' + (_desk.i + 1) + ' of ' + _desk.items.length + '</span>') +
+    '</div>';
+}
+
+async function deskRedraft(id, mode) {
+  if (_desk.mode === 'rewriting') return;
+  const steer = document.getElementById('desk-rw-note');
+  const instruction = steer ? steer.value.trim() : '';
+  _desk.mode = 'rewriting';
+  renderDeskArea();
+  let data = null;
+  try {
+    data = await api('/api/outbox/' + encodeURIComponent(id) + '/redraft', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: mode, instruction: instruction}),
+    });
+  } finally {
+    _desk.mode = null;
+  }
+  if (!data || !data.success) {
+    showToast(failMsg(data, 'Couldn\'t bring it back.'), 'error');
+    renderDeskArea();
+    return;
+  }
+  const more = data.restored > 1 ? ' Its ' + (data.restored - 1) + ' follow-up' +
+    (data.restored === 2 ? '' : 's') + ' came back too.' : '';
+  showToast((mode === 'rewrite' ? 'Drafted again in your style' : 'Brought back as it was') +
+    ' and waiting for you.' + more, 'success');
+  _desk.focus = id;
+  loadOutbox();
+}
+
 function renderDesk(items, i) {
   const cur = items[i];
   const rail = items.map((it, n) => {
@@ -1898,6 +2025,7 @@ function renderDesk(items, i) {
       '<span class="avatar">' + initials(parts[0], parts[1]) + '</span>' +
       '<div class="di-text"><div class="to">' + escHtml(who) +
         (heldReason(it) ? ' <span class="tag t-bad" title="Harvey held this instead of sending it">Held</span>' : '') +
+        (it.kind === 'sequence' && it.step > 1 ? ' <span class="tag">Email ' + escHtml(String(it.step)) + '</span>' : '') +
         '</div>' +
       '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div></div>' +
     '</div>';
@@ -1962,13 +2090,7 @@ function renderDesk(items, i) {
         'Reject <kbd>R</kbd></button>';
   }
 
-  return '<div class="desk">' +
-    '<div class="desk-list">' + rail + '</div>' +
-    '<div class="desk-pane">' +
-      '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b>' +
-        '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
-        '<span class="muted">sends ' + formatDate(cur.send_at) + '</span></div>' +
-      renderDeskContext(cur.context) +
+  const reviewPane =
       (heldReason(cur)
         ? '<div class="banner wait desk-held">' + icon('alert') + '<div><b>Harvey held this instead of sending it</b>' +
           '<div>' + escHtml(heldReason(cur)) + '. Read it before approving: text from a website or an ' +
@@ -1980,7 +2102,15 @@ function renderDesk(items, i) {
         (_desk.mode === 'reject' || _desk.mode === 'approve' ? '' :
           '<span class="muted" style="font-size:12px;margin-left:auto">' +
             (i + 1) + ' of ' + items.length + '</span>') +
-      '</div>' +
+      '</div>';
+  return '<div class="desk">' +
+    '<div class="desk-list">' + rail + '</div>' +
+    '<div class="desk-pane">' +
+      '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b>' +
+        '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
+        (_desk.view === 'rejected' ? '' : '<span class="muted">sends ' + formatDate(cur.send_at) + '</span>') + '</div>' +
+      renderDeskContext(cur.context) +
+      (_desk.view === 'rejected' ? renderRejectedPane(cur) : reviewPane) +
     '</div></div>';
 }
 
@@ -1989,7 +2119,7 @@ function deskEdit(id) {
   _desk.unsaved = null;
   _desk.mode = null;
   if (!id) _desk.rewrite = null;
-  document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
+  renderDeskArea();
   if (id) document.getElementById('desk-body').focus();
 }
 
@@ -2037,7 +2167,7 @@ function deskGo(n) {
   if (n < 0 || n >= _desk.items.length || deskBusy()) return;
   _desk.i = n;
   _desk.mode = null;
-  document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, n);
+  renderDeskArea();
 }
 
 // Keyboard review. Ignored while typing into a field, so Settings still works.
@@ -2068,6 +2198,12 @@ document.addEventListener('keydown', e => {
   if (_desk.mode === 'rewriting') return;
   if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
   const k = e.key.toLowerCase();
+  if (_desk.view === 'rejected') {
+    if (k === 'j') { e.preventDefault(); deskGo(_desk.i + 1); }
+    else if (k === 'k') { e.preventDefault(); deskGo(_desk.i - 1); }
+    else if (k === 'd' && cur) { e.preventDefault(); deskRedraft(cur.id, 'rewrite'); }
+    return;
+  }
   if (k === 'j') { e.preventDefault(); deskGo(_desk.i + 1); }
   else if (k === 'k') { e.preventDefault(); deskGo(_desk.i - 1); }
   else if (k === 'a' && cur) { e.preventDefault(); deskAsk('approve'); }
@@ -2081,7 +2217,7 @@ document.addEventListener('keydown', e => {
 // Reasons about the prospect reject at once; reasons about the writing ask
 // for a note, because that note is what the Writer learns from.
 
-function renderDesk_() { document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i); }
+function renderDesk_() { renderDeskArea(); }
 
 function deskAsk(mode) {
   if (mode && deskBusy()) return;

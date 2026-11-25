@@ -937,6 +937,30 @@ def _in(ids) -> str:
     return ",".join("?" for _ in ids)
 
 
+async def _sequences(prospect_ids) -> dict[str, list[dict]]:
+    """Each person's cold-email sequence as it stands, step by step."""
+    pids = sorted({p for p in prospect_ids if p})
+    if not pids:
+        return {}
+    out: dict[str, list[dict]] = {}
+    for r in await query_db(
+            "SELECT id, prospect_id, step, status, send_at, sent_at FROM outbox "
+            f"WHERE kind = 'sequence' AND prospect_id IN ({_in(pids)}) "
+            "ORDER BY step", tuple(pids)):
+        out.setdefault(r["prospect_id"], []).append(
+            {k: r[k] for k in ("id", "step", "status", "send_at", "sent_at")})
+    return out
+
+
+async def _with_next_step(items: list[dict]) -> list[dict]:
+    """A sent cold email, with what happens next if nobody answers."""
+    seqs = await _sequences(i.get("prospect_id") for i in items if i.get("kind") == "sequence")
+    for i in items:
+        later = [s for s in seqs.get(i.get("prospect_id"), []) if s["step"] > (i.get("step") or 0)]
+        i["next_step"] = later[0] if later else None
+    return items
+
+
 async def _with_context(items: list[dict]) -> list[dict]:
     """Attach the campaign, company, contact and signals behind each draft."""
     if not items:
@@ -955,6 +979,7 @@ async def _with_context(items: list[dict]) -> list[dict]:
         tuple(cids)) if cids else [])}
 
     company_ids = sorted({p["company_id"] for p in people.values() if p.get("company_id")})
+    seqs = await _sequences(pids)
     tags: dict[str, str] = {}
     if company_ids:
         for r in await query_db(
@@ -1014,6 +1039,8 @@ async def _with_context(items: list[dict]) -> list[dict]:
             "signals": signals.get(p.get("company_id"), {}),
             # What you tagged this company last time you approved for it.
             "tag": tags.get(p.get("company_id"), ""),
+            # Every step of their sequence: what went, what waits, what's next.
+            "sequence": seqs.get(item.get("prospect_id"), []),
         }
     return items
 
@@ -1030,12 +1057,27 @@ async def get_outbox_api():
         return {
             **_compliance_view(),
             "paused": await state.get_setting("sending_paused"),
-            "pending": await _with_context(
-                await state.get_outbox(status="pending_review", limit=100)),
+            # First emails and replies. Follow-ups are listed on their own:
+            # dated days later, they used to fall off the end of this list.
+            "pending": await _with_context(await query_db(
+                "SELECT * FROM outbox WHERE status = 'pending_review' "
+                "AND NOT (kind = 'sequence' AND step > 1) "
+                "ORDER BY send_at ASC, created_at ASC LIMIT 100")),
+            "followups": await _with_context(await query_db(
+                "SELECT * FROM outbox WHERE status = 'pending_review' "
+                "AND kind = 'sequence' AND step > 1 "
+                "ORDER BY send_at ASC, created_at ASC LIMIT 200")),
+            "waiting_total": (await query_db(
+                "SELECT COUNT(*) AS n FROM outbox WHERE status = 'pending_review'"))[0]["n"],
             # Mail going out right now leads the list.
             "approved": (await state.get_outbox(status="sending", limit=10)
                          + await state.get_outbox(status="approved", limit=50)),
-            "sent": (await query_db(
+            # Rejected drafts, with the facts behind them, so one can be
+            # drafted again from the Outbox's Rejected view.
+            "rejected": await _with_context(await query_db(
+                "SELECT * FROM outbox WHERE status = 'rejected' "
+                "ORDER BY updated_at DESC LIMIT 100")),
+            "sent": await _with_next_step(await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
             "failed": (await query_db(
@@ -1165,13 +1207,89 @@ async def outbox_approve(item_id: str, request: Request):
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
+@app.post("/api/outbox/{item_id}/redraft")
+async def outbox_redraft(item_id: str, request: Request):
+    """Bring a rejected cold email back to the Outbox for review.
+
+    Body: {"mode": "rewrite" (default) | "as_is", "instruction": "..."}.
+    "rewrite" writes it again in your style, told why you rejected it;
+    "as_is" brings back the draft unchanged. Follow-ups the rejection
+    cancelled come back too. Nothing is approved."""
+    from harvey.gate import pre_send_check
+    from harvey.state import REJECT_REASONS
+    body = await _json_body(request)
+    mode = str(body.get("mode") or "rewrite")
+    if mode not in ("rewrite", "as_is"):
+        return _refuse('mode must be "rewrite" or "as_is"', 400)
+    steer = " ".join(str(body.get("instruction") or "").split())
+    try:
+        state = _state()
+        await state.init_db()
+        why_not = await state.can_reopen_rejected(item_id)
+        if why_not:
+            return _refuse(why_not)
+        item = dict(await state.get_outbox_item(item_id))
+        subject, text, out = item.get("subject") or "", item.get("body") or "", {}
+        if mode == "rewrite":
+            reason = item.get("review_reason") or ""
+            told = []
+            if reason:
+                told.append("You rejected the earlier version: "
+                            + REJECT_REASONS.get(reason, reason).lower()
+                            + (f" ({item['review_note']})" if item.get("review_note") else "") + ".")
+            if steer:
+                told.append(steer)
+            out = await _rewrite(state, item, " ".join(told))
+            if not out:
+                return _refuse("The rewrite came back empty. Try again in a minute, "
+                               "or bring it back as it was and edit it.", 502)
+            subject, text = out["subject"], out["body"]
+        checked = text
+        footer = _compliance_view()["footer"]
+        if footer and not text.rstrip().endswith(footer):
+            checked = text.rstrip() + "\n\n" + footer
+        gate = pre_send_check("reviewer@example.com", subject, checked)
+        if not gate:
+            return _refuse("The sender would have blocked this draft: " + "; ".join(gate.reasons), 400)
+        n = await state.reopen_rejected(item_id, subject, text)
+        if not n:
+            return _refuse("Only rejected drafts can be drafted again.")
+        await state.log_action("outbox_redrafted", "dashboard", {
+            "outbox_id": item_id, "mode": mode, "old_reason": item.get("review_reason", ""),
+            "old_note": item.get("review_note", ""), "old_subject": item.get("subject", ""),
+            "old_body": item.get("body", ""), "restored": n})
+        return {"success": True, "id": item_id, "restored": n,
+                "changes": out.get("changes", ""), "learned_from": out.get("learned_from")}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+async def _rewrite(state, item: dict, instruction: str) -> dict | None:
+    """One rewrite of an outbox row in the reviewer's style (see harvey.rewriter)."""
+    from harvey.brain import Brain
+    from harvey.config import load_config
+    from harvey.rewriter import rewrite_draft
+    context = ((await _with_context([dict(item)]))[0].get("context") or {})
+    config = load_config(str(_resolve_config_file()))
+    brain = Brain(state, config.brain)
+    base = brain.load_prompt(
+        "writer",
+        product_name=config.product.name,
+        product_description=config.product.description,
+        product_benefits="\n".join(f"- {b}" for b in config.product.key_benefits),
+        product_pricing=config.product.pricing,
+        persona_name=config.persona.name,
+        persona_company=config.persona.company,
+        persona_role=config.persona.role,
+        persona_tone=config.persona.tone,
+    ) or ""
+    return await rewrite_draft(state, brain, dict(item), context, instruction, base)
+
+
 @app.post("/api/outbox/{item_id}/rewrite")
 async def outbox_rewrite(item_id: str, request: Request):
     """Rewrite a draft awaiting review in your own style. Saves nothing:
     the result comes back for you to read, change and save as an edit."""
-    from harvey.brain import Brain
-    from harvey.config import load_config
-    from harvey.rewriter import rewrite_draft
     instruction = str((await _json_body(request)).get("instruction") or "")
     try:
         state = _state()
@@ -1179,21 +1297,7 @@ async def outbox_rewrite(item_id: str, request: Request):
         item = await state.get_outbox_item(item_id)
         if not item or item.get("status") != "pending_review":
             return _refuse("Only drafts awaiting review can be rewritten.")
-        context = ((await _with_context([dict(item)]))[0].get("context") or {})
-        config = load_config(str(_resolve_config_file()))
-        brain = Brain(state, config.brain)
-        base = brain.load_prompt(
-            "writer",
-            product_name=config.product.name,
-            product_description=config.product.description,
-            product_benefits="\n".join(f"- {b}" for b in config.product.key_benefits),
-            product_pricing=config.product.pricing,
-            persona_name=config.persona.name,
-            persona_company=config.persona.company,
-            persona_role=config.persona.role,
-            persona_tone=config.persona.tone,
-        ) or ""
-        out = await rewrite_draft(state, brain, dict(item), context, instruction, base)
+        out = await _rewrite(state, dict(item), instruction)
         if not out:
             return _refuse("The rewrite came back empty. Try again in a minute, or edit by hand.", 502)
         return {"success": True, **out}

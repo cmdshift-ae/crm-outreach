@@ -93,12 +93,16 @@ def test_not_a_fit_clears_everyone_queued_at_that_company_only(client):
     assert _status(state, items[("globex", 1)]) == "pending_review"
 
 
-def test_a_writing_reject_keeps_the_rest_of_the_sequence(client):
+def test_a_writing_reject_clears_only_the_later_emails_it_would_have_led_to(client):
     state, items = asyncio.run(_seed(client.db_path))
+    r = client.post(f"/api/outbox/{items[('ops', 2)]}/reject",
+                    json={"reason": "weak_email", "note": "too long"})
+    assert r.json() == {"success": True, "cancelled": 1}
+    assert _status(state, items[("ops", 1)]) == "pending_review"
+    assert _status(state, items[("ops", 3)]) == "cancelled"
     r = client.post(f"/api/outbox/{items[('ops', 1)]}/reject",
                     json={"reason": "weak_email", "note": "too long, sounds like a template"})
     assert r.json() == {"success": True, "cancelled": 0}
-    assert _status(state, items[("ops", 2)]) == "pending_review"
     assert asyncio.run(state.get_outbox_item(items[("ops", 1)]))["review_note"] == \
         "too long, sounds like a template"
 
@@ -190,3 +194,86 @@ def test_style_profile_measures_simple_habits():
     assert p["uses_contractions"] is True
     assert p["common_openers"][0] == "hi there"
     assert style_profile([]) == {}
+
+
+# ── Drafting a rejected email again ──
+
+def test_rejected_drafts_are_listed_with_their_context(client):
+    _, items = asyncio.run(_seed(client.db_path))
+    client.post(f"/api/outbox/{items[('ops', 1)]}/reject", json={"reason": "weak_email", "note": "too stiff"})
+    rejected = client.get("/api/outbox").json()["rejected"]
+    assert [r["id"] for r in rejected] == [items[("ops", 1)]]
+    assert rejected[0]["review_note"] == "too stiff"
+    assert rejected[0]["context"]["company"] == "Acme Fitouts"
+
+
+def test_bringing_back_as_it_was_restores_the_follow_ups_its_reject_cancelled(client):
+    state, items = asyncio.run(_seed(client.db_path))
+    client.post(f"/api/outbox/{items[('inbox', 1)]}/reject", json={"reason": "wrong_person"})
+    r = client.post(f"/api/outbox/{items[('inbox', 1)]}/redraft", json={"mode": "as_is"})
+    assert r.json()["success"] and r.json()["restored"] == 3
+    for step in (1, 2, 3):
+        assert _status(state, items[("inbox", step)]) == "pending_review"
+    item = asyncio.run(state.get_outbox_item(items[("inbox", 1)]))
+    assert item["approved_by"] == "" and item["subject"] == "step 1"
+
+
+def test_drafting_again_tells_the_rewrite_why_it_was_rejected(client, monkeypatch):
+    state, items = asyncio.run(_seed(client.db_path))
+    client.post(f"/api/outbox/{items[('ops', 1)]}/reject",
+                json={"reason": "weak_email", "note": "mention their fit-out work"})
+    seen = {}
+
+    async def fake_think_json(self, prompt, **kw):
+        seen["prompt"] = prompt
+        return {"subject": "fit-out timing", "body": "Hi there,\n\nWho plans your fit-outs?",
+                "changes": "Leads with fit-outs."}
+
+    monkeypatch.setattr(dash, "_resolve_config_file",
+                        lambda: Path(__file__).resolve().parent.parent / "harvey.yaml")
+    monkeypatch.setattr("harvey.brain.Brain.think_json", fake_think_json)
+    r = client.post(f"/api/outbox/{items[('ops', 1)]}/redraft", json={"instruction": "keep it short"})
+    assert r.json()["success"]
+    assert "mention their fit-out work" in seen["prompt"] and "keep it short" in seen["prompt"]
+    item = asyncio.run(state.get_outbox_item(items[("ops", 1)]))
+    assert (item["status"], item["subject"]) == ("pending_review", "fit-out timing")
+    assert _status(state, items[("ops", 2)]) == "pending_review"   # its follow-ups came back
+
+
+def test_a_company_that_replied_cant_be_drafted_again(client):
+    state, items = asyncio.run(_seed(client.db_path))
+    client.post(f"/api/outbox/{items[('ops', 1)]}/reject", json={"reason": "weak_email"})
+    pid = asyncio.run(state.get_outbox_item(items[("inbox", 1)]))["prospect_id"]
+    asyncio.run(state.update_prospect_status(pid, "replied"))
+    r = client.post(f"/api/outbox/{items[('ops', 1)]}/redraft", json={"mode": "as_is"})
+    assert r.status_code == 409 and "replied" in r.json()["message"]
+    assert _status(state, items[("ops", 1)]) == "rejected"
+
+
+def test_only_rejected_drafts_can_be_drafted_again(client):
+    _, items = asyncio.run(_seed(client.db_path))
+    assert client.post(f"/api/outbox/{items[('ops', 1)]}/redraft",
+                       json={"mode": "as_is"}).status_code == 409
+
+
+# ── Follow-ups have their own list, so they can't fall off the end ──
+
+def test_follow_ups_are_listed_apart_from_first_emails(client):
+    _, items = asyncio.run(_seed(client.db_path))
+    data = client.get("/api/outbox").json()
+    assert {p["step"] for p in data["pending"]} == {1}
+    assert {p["step"] for p in data["followups"]} == {2, 3}
+    assert data["waiting_total"] == 9
+    seq = data["pending"][0]["context"]["sequence"]
+    assert [s["step"] for s in seq] == [1, 2, 3]
+
+
+def test_a_sent_email_says_what_happens_next_if_nobody_answers(client):
+    state, items = asyncio.run(_seed(client.db_path))
+
+    async def send_first():
+        await state.update_outbox_item(items[("ops", 1)], status="sent", sent_at="2026-01-02T09:00:00")
+    asyncio.run(send_first())
+    sent = client.get("/api/outbox").json()["sent"]
+    assert sent[0]["next_step"]["step"] == 2
+    assert sent[0]["next_step"]["status"] == "pending_review"

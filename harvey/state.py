@@ -1326,8 +1326,9 @@ class StateManager:
             return cursor.rowcount
 
     async def cancel_after_reject(self, item_id: str) -> int:
-        """After a rejection whose reason is about the prospect (wrong inbox,
-        wrong person, not a fit), cancel the sequence emails still queued for
+        """After a rejection, cancel the later emails in that sequence (they
+        can't go without it). When the reason is about the prospect (wrong
+        inbox, wrong person, not a fit), cancel everything still queued for
         them, and for not_a_fit everyone queued at their company, so none of
         it comes back for review. Replies Harvey owes someone who wrote in
         are never touched. Returns how many were cancelled."""
@@ -1335,10 +1336,24 @@ class StateManager:
         if not item or item.get("status") != "rejected":
             return 0
         reason = item.get("review_reason") or ""
-        if reason not in REJECT_STOPS_PROSPECT or not item.get("prospect_id"):
+        if not item.get("prospect_id") or item.get("kind") != "sequence":
             return 0
-        why = REJECTED_EARLIER + REJECT_REASONS[reason].lower()
+        why = REJECTED_EARLIER + REJECT_REASONS.get(reason, "no reason given").lower()
         now = _utcnow().isoformat()
+        if reason not in REJECT_STOPS_PROSPECT:
+            # A reject about the wording: the later emails in this sequence
+            # can never go without this one, so they leave the review list.
+            # Drafting this one again brings them back.
+            async with self._connect() as db:
+                cursor = await db.execute(
+                    "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+                    "WHERE prospect_id = ? AND campaign_id = ? AND kind = 'sequence' "
+                    "AND step > ? AND status IN ('pending_review', 'approved')",
+                    (why, now, item["prospect_id"], item.get("campaign_id") or "",
+                     item.get("step") or 1),
+                )
+                await db.commit()
+                return cursor.rowcount
         async with self._connect() as db:
             pids = [item["prospect_id"]]
             if reason == "not_a_fit":
@@ -1358,6 +1373,82 @@ class StateManager:
             )
             await db.commit()
             return cursor.rowcount
+
+    # A reply, an opt-out or a meeting at the company means Harvey stops
+    # writing to it; a rejected draft there can't be brought back.
+    _STOPPED_PROSPECT = ("replied", "opted_out", "meeting", "lost", "closed")
+
+    async def can_reopen_rejected(self, item_id: str) -> str:
+        """"" when a rejected draft may go back for review, else why not."""
+        item = await self.get_outbox_item(item_id)
+        if not item or item.get("status") != "rejected":
+            return "Only rejected drafts can be drafted again."
+        if item.get("kind") != "sequence":
+            return "Only cold emails can be drafted again; a reply has moved on."
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT p2.status, p2.email_status, p2.id = p1.id AS same FROM prospects p1 "
+                "JOIN prospects p2 ON p2.id = p1.id "
+                "OR (p1.company_id != '' AND p2.company_id = p1.company_id) "
+                "WHERE p1.id = ?", (item.get("prospect_id") or "",),
+            ) as cursor:
+                rows = [dict(r) for r in await cursor.fetchall()]
+        if not rows:
+            return "The contact behind this draft is gone."
+        for r in rows:
+            if r["same"] and r["email_status"] == "invalid":
+                return "This address bounced, so Harvey won't email it."
+            if r["status"] in self._STOPPED_PROSPECT:
+                return ("Someone at this company has already replied or opted out, "
+                        "so Harvey has stopped writing to it.")
+        return ""
+
+    async def reopen_rejected(self, item_id: str, subject: str, body: str) -> int:
+        """Put a rejected cold email back in the Outbox for review, with this
+        subject and body, and bring back the follow-ups its rejection
+        cancelled. Never approves anything. It's rescheduled from now and
+        the follow-ups keep their gaps. Returns how many came back (0 when
+        it wasn't rejected)."""
+        item = await self.get_outbox_item(item_id)
+        if not item or item.get("status") != "rejected":
+            return 0
+        now = _utcnow()
+
+        def _at(value):
+            try:
+                return datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                return now
+        first = _at(item.get("send_at"))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'pending_review', subject = ?, body = ?, "
+                "send_at = ?, error = '', approved_by = '', approve_tag = '', "
+                "updated_at = ? WHERE id = ? AND status = 'rejected'",
+                (subject, body, now.isoformat(), now.isoformat(), item_id),
+            )
+            if cursor.rowcount != 1:
+                await db.commit()
+                return 0
+            async with db.execute(
+                "SELECT id, send_at FROM outbox WHERE prospect_id = ? AND kind = 'sequence' "
+                "AND campaign_id = ? AND step > ? AND status = 'cancelled' "
+                "AND substr(COALESCE(error, ''), 1, ?) = ?",
+                (item.get("prospect_id"), item.get("campaign_id") or "", item.get("step") or 1,
+                 len(REJECTED_EARLIER), REJECTED_EARLIER),
+            ) as cur:
+                followups = [dict(r) for r in await cur.fetchall()]
+            for f in followups:
+                send_at = now + max(timedelta(0), _at(f["send_at"]) - first)
+                await db.execute(
+                    "UPDATE outbox SET status = 'pending_review', error = '', send_at = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (send_at.isoformat(), now.isoformat(), f["id"]),
+                )
+            await db.commit()
+            return 1 + len(followups)
 
     async def get_review_feedback(self, days: int = 90, notes: int = 20) -> dict:
         """Why drafts were rejected and how approvals were tagged, for the

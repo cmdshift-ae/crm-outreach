@@ -1060,3 +1060,11 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .warmup-actions { margin-top: var(--sp-2); align-items: center; }
 a.btn, a.btn:hover { text-decoration: none; }
 .warmup-actions .form-input { flex: 1 1 200px; height: 28px; min-width: 0; }
+
+/* Outbox: Waiting for you / Rejected */
+.desk-views { display: inline-flex; gap: 2px; padding: 3px; margin-bottom: var(--sp-3);
+  background: var(--surface-2); border-radius: var(--r-md); }
+.desk-view { font: inherit; font-size: var(--fs-ui); color: var(--text-2); background: none; border: 0;
+  padding: 6px 12px; border-radius: var(--r-sm, 6px); cursor: pointer; }
+.desk-view.on { background: var(--surface); color: var(--text); box-shadow: var(--btn-shadow); }
+.desk-view .hint { color: var(--text-3); margin-left: 4px; }
