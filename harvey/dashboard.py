@@ -955,6 +955,14 @@ async def _with_context(items: list[dict]) -> list[dict]:
         tuple(cids)) if cids else [])}
 
     company_ids = sorted({p["company_id"] for p in people.values() if p.get("company_id")})
+    tags: dict[str, str] = {}
+    if company_ids:
+        for r in await query_db(
+                "SELECT p.company_id, o.approve_tag FROM outbox o "
+                "JOIN prospects p ON p.id = o.prospect_id "
+                f"WHERE o.approve_tag != '' AND p.company_id IN ({_in(company_ids)}) "
+                "ORDER BY o.updated_at", tuple(company_ids)):
+            tags[r["company_id"]] = r["approve_tag"]   # the newest wins
     signals: dict[str, dict[str, str]] = {}
     if company_ids:
         rows = await query_db(
@@ -1004,6 +1012,8 @@ async def _with_context(items: list[dict]) -> list[dict]:
             "score": p.get("score"),
             "notes": p.get("personalization_notes", ""),
             "signals": signals.get(p.get("company_id"), {}),
+            # What you tagged this company last time you approved for it.
+            "tag": tags.get(p.get("company_id"), ""),
         }
     return items
 
@@ -1101,13 +1111,92 @@ async def outbox_approve_all():
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
-@app.post("/api/outbox/{item_id}/approve")
-async def outbox_approve(item_id: str):
+async def _json_body(request: Request) -> dict:
+    """The request's JSON object, or {} (no body, bad JSON, not an object)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+@app.get("/api/outbox/review-options")
+async def outbox_review_options():
+    """The reasons a reviewer can give for a reject, and the approve tags."""
+    from harvey.state import APPROVE_TAGS, REJECT_REASONS, REJECT_STOPS_PROSPECT
+    return {
+        "reject_reasons": [{"key": k, "label": v, "stops_prospect": k in REJECT_STOPS_PROSPECT}
+                           for k, v in REJECT_REASONS.items()],
+        "approve_tags": [{"key": k, "label": v} for k, v in APPROVE_TAGS.items()],
+    }
+
+
+@app.get("/api/outbox/feedback")
+async def outbox_feedback():
+    """Why you rejected drafts and how you tagged approvals: in one place,
+    instead of scattered across campaigns."""
+    from harvey.state import APPROVE_TAGS, REJECT_REASONS
     try:
         state = _state()
         await state.init_db()
-        n = await state.approve_outbox(item_id)
+        fb = await state.get_review_feedback()
+        return {**fb, "reason_labels": {**REJECT_REASONS, "unspecified": "No reason given"},
+                "tag_labels": APPROVE_TAGS}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/outbox/{item_id}/approve")
+async def outbox_approve(item_id: str, request: Request):
+    """Approve one draft. Body (optional): {"tag": "client" | "partner"}."""
+    from harvey.state import APPROVE_TAGS
+    tag = str((await _json_body(request)).get("tag") or "")
+    if tag and tag not in APPROVE_TAGS:
+        return _refuse("Unknown tag: use one of " + ", ".join(APPROVE_TAGS), 400)
+    try:
+        state = _state()
+        await state.init_db()
+        n = await state.approve_outbox(item_id, tag=tag)
+        if n and tag:
+            await state.log_action("outbox_tagged", "dashboard",
+                                   {"outbox_id": item_id, "tag": tag})
         return {"success": bool(n)}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/rewrite")
+async def outbox_rewrite(item_id: str, request: Request):
+    """Rewrite a draft awaiting review in your own style. Saves nothing:
+    the result comes back for you to read, change and save as an edit."""
+    from harvey.brain import Brain
+    from harvey.config import load_config
+    from harvey.rewriter import rewrite_draft
+    instruction = str((await _json_body(request)).get("instruction") or "")
+    try:
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if not item or item.get("status") != "pending_review":
+            return _refuse("Only drafts awaiting review can be rewritten.")
+        context = ((await _with_context([dict(item)]))[0].get("context") or {})
+        config = load_config(str(_resolve_config_file()))
+        brain = Brain(state, config.brain)
+        base = brain.load_prompt(
+            "writer",
+            product_name=config.product.name,
+            product_description=config.product.description,
+            product_benefits="\n".join(f"- {b}" for b in config.product.key_benefits),
+            product_pricing=config.product.pricing,
+            persona_name=config.persona.name,
+            persona_company=config.persona.company,
+            persona_role=config.persona.role,
+            persona_tone=config.persona.tone,
+        ) or ""
+        out = await rewrite_draft(state, brain, dict(item), context, instruction, base)
+        if not out:
+            return _refuse("The rewrite came back empty. Try again in a minute, or edit by hand.", 502)
+        return {"success": True, **out}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -1351,13 +1440,29 @@ async def mark_prospect_sent(prospect_id: str, request: Request):
 
 
 @app.post("/api/outbox/{item_id}/reject")
-async def outbox_reject(item_id: str):
+async def outbox_reject(item_id: str, request: Request):
+    """Reject one draft. Body (optional): {"reason": <REJECT_REASONS key>,
+    "note": "..."}. "other" needs a note. A reason about the prospect (wrong
+    inbox, wrong person, not a fit) also cancels what's still queued for them."""
+    from harvey.state import REJECT_REASONS
+    body = await _json_body(request)
+    reason = str(body.get("reason") or "")
+    note = " ".join(str(body.get("note") or "").split())
+    if reason and reason not in REJECT_REASONS:
+        return _refuse("Unknown reason: use one of " + ", ".join(REJECT_REASONS), 400)
+    if reason == "other" and not note:
+        return _refuse("Say a few words about why, so Harvey can learn from it.", 400)
     try:
         state = _state()
         await state.init_db()
-        if not await state.reject_outbox_item(item_id):
+        if not await state.reject_outbox_item(item_id, reason=reason, note=note):
             return _refuse("That email is already sending or sent, so it can't be rejected.")
-        return {"success": True}
+        cancelled = await state.cancel_after_reject(item_id)
+        if reason:
+            await state.log_action("outbox_rejected", "dashboard", {
+                "outbox_id": item_id, "reason": reason, "note": note[:500],
+                "cancelled": cancelled})
+        return {"success": True, "cancelled": cancelled}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 

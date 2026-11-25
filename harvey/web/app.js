@@ -3,6 +3,8 @@ let companyDrill = false;      // true while viewing a single company's contacts
 let _companies = [], _prospects = [], _campaigns = [];
 let _signals = null;           // last /api/signals payload, for the cohort builder
 let _desk = { items: [], i: 0 };
+// Reject reasons and approve tags, from /api/outbox/review-options.
+let _review = null;
 
 // ── Appearance ──
 //
@@ -1594,7 +1596,11 @@ async function loadUsage() {
 // wait in the rail.
 
 async function loadOutbox() {
-  const [data, mode] = await Promise.all([api('/api/outbox'), api('/api/sending-mode')]);
+  const [data, mode, opts, feedback] = await Promise.all([
+    api('/api/outbox'), api('/api/sending-mode'),
+    _review ? Promise.resolve(_review) : api('/api/outbox/review-options'),
+    api('/api/outbox/feedback')]);
+  if (opts && !opts.error) _review = opts;
   _sendingMode = mode && !mode.error ? mode : null;
   const banner = document.getElementById('outbox-banner');
   const desk = document.getElementById('outbox-desk');
@@ -1677,8 +1683,58 @@ async function loadOutbox() {
     ]) +
     table('Didn\'t send', data.failed, [
       ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
-      ['Reason', r => r.error, true], ['Updated', r => formatDate(r.updated_at), true],
-    ]);
+      ['Reason', r => r.review_reason ? reasonLabel(r.review_reason) +
+        (r.review_note ? ': ' + r.review_note : '') : r.error, true],
+      ['Updated', r => formatDate(r.updated_at), true],
+    ]) + renderReviewFeedback(feedback);
+}
+
+function reasonLabel(key) {
+  const r = _review && _review.reject_reasons.find(x => x.key === key);
+  return r ? r.label : key;
+}
+function tagLabel(key) {
+  const t = _review && _review.approve_tags.find(x => x.key === key);
+  return t ? t.label : key;
+}
+
+// Your reject reasons and approve tags in one place: what keeps coming back
+// is what to fix in targeting (who Harvey finds) or in writing (what it says).
+function renderReviewFeedback(fb) {
+  if (!fb || fb.error) return '';
+  const reasons = Object.entries(fb.reasons || {}).sort((a, b) => b[1] - a[1]);
+  const tags = Object.entries(fb.tags || {});
+  if (!reasons.length && !tags.length) return '';
+  const total = reasons.reduce((n, r) => n + r[1], 0) || 1;
+  const labels = fb.reason_labels || {};
+  const bars = reasons.map(([k, n]) =>
+    '<div class="fb-row"><span>' + escHtml(labels[k] || k) + '</span>' +
+      '<span class="fb-bar"><i style="width:' + Math.round(n / total * 100) + '%"></i></span>' +
+      '<b>' + n + '</b></div>').join('');
+  const tagChips = tags.map(([k, n]) =>
+    '<span class="tag">' + escHtml((fb.tag_labels || {})[k] || k) + ' · ' + n + '</span>').join(' ');
+  const hint = (() => {
+    const top = reasons[0] && reasons[0][0];
+    if (top === 'generic_inbox') return 'Most rejects are general inboxes: Harvey needs named people. Look at who your ICP targets, or how contacts are found.';
+    if (top === 'not_a_fit') return 'Most rejects are businesses that aren\'t a fit: tighten the industries and signals in your cohort.';
+    if (top === 'wrong_person') return 'Most rejects are the wrong person: set icp.titles to the roles that buy.';
+    if (top === 'weak_email') return 'Most rejects are the writing: Harvey reads your notes on these before every new draft.';
+    return '';
+  })();
+  const rows = (fb.recent || []).map(r =>
+    '<tr><td>' + escHtml(r.company || r.to_email) + '</td>' +
+      '<td>' + escHtml(labels[r.review_reason] || r.review_reason) + '</td>' +
+      '<td class="muted">' + escHtml(r.review_note || '') + '</td>' +
+      '<td class="muted">' + escHtml(r.campaign || '') + '</td>' +
+      '<td class="muted">' + formatDate(r.updated_at) + '</td></tr>').join('');
+  return '<div class="subhead">Your review feedback <span class="hint">last ' + fb.days + ' days</span></div>' +
+    '<div class="card fb-card">' +
+      (bars ? '<div class="fb-bars">' + bars + '</div>' : '') +
+      (tagChips ? '<div class="fb-tags"><span class="muted">Approved as</span> ' + tagChips + '</div>' : '') +
+      (hint ? '<p class="muted fb-hint">' + escHtml(hint) + '</p>' : '') +
+    '</div>' +
+    (rows ? '<div class="table-card"><table class="nowrap clip"><thead><tr><th>Company</th><th>Why</th>' +
+      '<th>Your note</th><th>Campaign</th><th>When</th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '');
 }
 
 const CONTACT_SOURCES = {
@@ -1717,6 +1773,7 @@ function renderDeskContext(ctx) {
     row('Campaign', ctx.campaign ? escHtml(ctx.campaign) +
       ' <span class="muted">(how they were found, not a fact about them)</span>' : '') +
     row('Writer notes', escHtml(ctx.notes)) +
+    row('Tagged', ctx.tag ? '<span class="tag">' + escHtml(tagLabel(ctx.tag)) + '</span>' : '') +
   '</div>';
 }
 
@@ -1865,15 +1922,45 @@ function renderDesk(items, i) {
   const footer = added
     ? '<div class="desk-footer" title="Added when it sends (compliance in harvey.yaml)">' +
         escHtml(added) + '</div>' : '';
-  const actions = editing
-    ? '<button class="btn btn-primary" onclick="deskSave(' + jsq(cur.id) + ')">Save</button>' +
-      '<button class="btn btn-secondary" onclick="deskEdit(null)">Cancel</button>'
-    : '<button class="btn btn-primary" onclick="outboxAct(' + jsq(cur.id) + ',\'approve\')">' +
+  const rw = editing && _desk.rewrite && _desk.rewrite.id === cur.id ? _desk.rewrite : null;
+  const rewriteNote = rw
+    ? '<div class="banner good desk-rewrite">' + icon('check') + '<div><b>Rewritten in your style</b>' +
+        '<div>' + (rw.changes ? escHtml(rw.changes) + ' ' : '') +
+        '<span class="muted">Learned from ' + rw.learned_from.edits + ' of your edits, ' +
+        rw.learned_from.approved + ' approved emails' +
+        (rw.learned_from.past_emails ? ' and ' + rw.learned_from.past_emails + ' past emails with this company' : '') +
+        '. Read it, change anything, then save.</span></div></div></div>'
+    : '';
+  const rewriteAgain = editing
+    ? '<div class="desk-rewrite-again"><input id="desk-rw-note" class="form-input" ' +
+        'placeholder="Steer the rewrite (optional): shorter, warmer, ask about their fit-outs…" ' +
+        'onkeydown="if(event.key===\'Enter\'){event.preventDefault();deskRewrite(' + jsq(cur.id) + ')}">' +
+      '<button class="btn btn-secondary" onclick="deskRewrite(' + jsq(cur.id) + ')"' +
+        (_desk.mode === 'rewriting' ? ' disabled' : '') + '>' +
+        (_desk.mode === 'rewriting' ? 'Rewriting…' : (rw ? 'Rewrite again' : 'Rewrite in my style')) +
+      '</button></div>'
+    : '';
+  let actions;
+  if (editing) {
+    actions = '<button class="btn btn-primary" onclick="deskSave(' + jsq(cur.id) + ')">Save</button>' +
+      '<button class="btn btn-secondary" onclick="deskEdit(null)">Cancel</button>';
+  } else if (_desk.mode === 'reject') {
+    actions = renderRejectPicker(cur);
+  } else if (_desk.mode === 'approve') {
+    actions = renderApprovePicker(cur);
+  } else if (_desk.mode === 'rewriting') {
+    actions = '<span class="muted">Rewriting in your style… this takes a few seconds.</span>';
+  } else {
+    actions = '<button class="btn btn-primary" onclick="deskAsk(\'approve\')">' +
         'Approve <kbd>A</kbd></button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(' + jsq(cur.id) + ')">' +
         'Edit <kbd>E</kbd></button>' +
-      '<button class="btn btn-secondary" onclick="outboxAct(' + jsq(cur.id) + ',\'reject\')">' +
+      '<button class="btn btn-secondary" onclick="deskRewrite(' + jsq(cur.id) + ')" ' +
+        'title="Rewrite it the way you write, learned from emails you edited and approved">' +
+        'Rewrite in my style <kbd>W</kbd></button>' +
+      '<button class="btn btn-secondary" onclick="deskAsk(\'reject\')">' +
         'Reject <kbd>R</kbd></button>';
+  }
 
   return '<div class="desk">' +
     '<div class="desk-list">' + rail + '</div>' +
@@ -1887,10 +1974,12 @@ function renderDesk(items, i) {
           '<div>' + escHtml(heldReason(cur)) + '. Read it before approving: text from a website or an ' +
           'email can try to steer what Harvey writes.</div></div></div>'
         : '') +
-      draft + footer +
-      '<div class="desk-actions">' + actions +
-        '<span class="muted" style="font-size:12px;margin-left:auto">' +
-          (i + 1) + ' of ' + items.length + '</span>' +
+      rewriteNote + draft + footer + rewriteAgain +
+      '<div class="desk-actions' + (_desk.mode === 'reject' || _desk.mode === 'approve' ? ' picking' : '') + '">' +
+        actions +
+        (_desk.mode === 'reject' || _desk.mode === 'approve' ? '' :
+          '<span class="muted" style="font-size:12px;margin-left:auto">' +
+            (i + 1) + ' of ' + items.length + '</span>') +
       '</div>' +
     '</div></div>';
 }
@@ -1898,6 +1987,8 @@ function renderDesk(items, i) {
 function deskEdit(id) {
   _desk.editing = id;
   _desk.unsaved = null;
+  _desk.mode = null;
+  if (!id) _desk.rewrite = null;
   document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
   if (id) document.getElementById('desk-body').focus();
 }
@@ -1934,6 +2025,7 @@ async function deskSave(id) {
   if (data && data.success) {
     _desk.editing = null;
     _desk.unsaved = null;
+    _desk.rewrite = null;
     showToast('Saved. Still waiting for your approval.', 'success');
     loadOutbox();
   } else {
@@ -1944,6 +2036,7 @@ async function deskSave(id) {
 function deskGo(n) {
   if (n < 0 || n >= _desk.items.length || deskBusy()) return;
   _desk.i = n;
+  _desk.mode = null;
   document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, n);
 }
 
@@ -1955,25 +2048,169 @@ document.addEventListener('keydown', e => {
   if (_desk.editing) {
     const typing = /^(input|textarea)$/i.test(e.target.tagName || '');
     if (e.key === 'Escape') { e.preventDefault(); deskEdit(null); }
-    else if (!typing && 'jkare'.includes(e.key.toLowerCase())) { e.preventDefault(); deskBusy(); }
+    else if (!typing && 'jkarew'.includes(e.key.toLowerCase())) { e.preventDefault(); deskBusy(); }
     return;
   }
   const tag = (e.target.tagName || '').toLowerCase();
-  if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
   const cur = _desk.items[_desk.i];
+  // The reject / approve pickers: a number picks, Enter confirms, Esc cancels.
+  if (_desk.mode === 'reject' || _desk.mode === 'approve') {
+    if (e.key === 'Escape') { e.preventDefault(); deskAsk(null); return; }
+    if (tag === 'textarea') {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); deskConfirm(); }
+      return;
+    }
+    const n = parseInt(e.key, 10);
+    if (n >= 1 && n <= 9) { e.preventDefault(); deskPick(n - 1); }
+    else if (e.key === 'Enter') { e.preventDefault(); deskConfirm(); }
+    return;
+  }
+  if (_desk.mode === 'rewriting') return;
+  if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
   const k = e.key.toLowerCase();
   if (k === 'j') { e.preventDefault(); deskGo(_desk.i + 1); }
   else if (k === 'k') { e.preventDefault(); deskGo(_desk.i - 1); }
-  else if (k === 'a' && cur) { e.preventDefault(); outboxAct(cur.id, 'approve'); }
-  else if (k === 'r' && cur) { e.preventDefault(); outboxAct(cur.id, 'reject'); }
+  else if (k === 'a' && cur) { e.preventDefault(); deskAsk('approve'); }
+  else if (k === 'r' && cur) { e.preventDefault(); deskAsk('reject'); }
   else if (k === 'e' && cur) { e.preventDefault(); deskEdit(cur.id); }
+  else if (k === 'w' && cur) { e.preventDefault(); deskRewrite(cur.id); }
 });
 
-async function outboxAct(id, action) {
+// ── Reject with a reason, approve with a tag ──
+// One extra keystroke each: R then 1-5, A then 1-2 (or Enter to skip the tag).
+// Reasons about the prospect reject at once; reasons about the writing ask
+// for a note, because that note is what the Writer learns from.
+
+function renderDesk_() { document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i); }
+
+function deskAsk(mode) {
+  if (mode && deskBusy()) return;
+  if (mode && !_review) { showToast('Still loading the review options. Try again in a second.', 'error'); return; }
+  _desk.mode = mode;
+  const cur = _desk.items[_desk.i];
+  _desk.pick = mode === 'approve' && cur && cur.context && cur.context.tag
+    ? _review.approve_tags.findIndex(t => t.key === cur.context.tag) : -1;
+  renderDesk_();
+}
+
+function renderRejectPicker(cur) {
+  const chips = _review.reject_reasons.map((r, n) =>
+    '<button class="pick-chip' + (_desk.pick === n ? ' on' : '') + '" onclick="deskPick(' + n + ')"' +
+      (r.stops_prospect ? ' title="Also cancels what\'s still queued for ' +
+        (r.key === 'not_a_fit' ? 'everyone at this company' : 'this person') + '"' : '') + '>' +
+      '<kbd>' + (n + 1) + '</kbd> ' + escHtml(r.label) + '</button>').join('');
+  const chosen = _review.reject_reasons[_desk.pick];
+  const needsNote = chosen && (chosen.key === 'other' || chosen.key === 'weak_email');
+  return '<div class="picker"><div class="picker-q">Why reject this one?</div>' +
+    '<div class="pick-chips">' + chips + '</div>' +
+    (needsNote
+      ? '<textarea id="reject-note" class="form-input" rows="2" placeholder="' +
+          (chosen.key === 'other' ? 'What\'s wrong with it? (needed for Other)'
+            : 'What would make it good? Harvey reads this before every new draft.') + '"></textarea>'
+      : '') +
+    '<div class="picker-actions">' +
+      (needsNote ? '<button class="btn btn-primary" onclick="deskConfirm()">Reject <kbd>Enter</kbd></button>' : '') +
+      '<button class="btn btn-ghost" onclick="deskRejectNoReason()">Reject without a reason</button>' +
+      '<button class="btn btn-ghost" onclick="deskAsk(null)">Cancel <kbd>Esc</kbd></button>' +
+    '</div></div>';
+}
+
+function renderApprovePicker(cur) {
+  const chips = _review.approve_tags.map((t, n) =>
+    '<button class="pick-chip' + (_desk.pick === n ? ' on' : '') + '" onclick="deskPick(' + n + ')">' +
+      '<kbd>' + (n + 1) + '</kbd> ' + escHtml(t.label) + '</button>').join('');
+  const pre = _review.approve_tags[_desk.pick];
+  return '<div class="picker"><div class="picker-q">Approve as…</div>' +
+    '<div class="pick-chips">' + chips + '</div>' +
+    '<div class="picker-actions">' +
+      '<button class="btn btn-primary" onclick="deskConfirm()">' +
+        (pre ? 'Approve as ' + escHtml(pre.label) : 'Approve without a tag') + ' <kbd>Enter</kbd></button>' +
+      '<button class="btn btn-ghost" onclick="deskAsk(null)">Cancel <kbd>Esc</kbd></button>' +
+    '</div></div>';
+}
+
+function deskPick(n) {
+  const list = _desk.mode === 'reject' ? _review.reject_reasons : _review.approve_tags;
+  if (n < 0 || n >= list.length) return;
+  _desk.pick = n;
+  const choice = list[n];
+  // A tag, or a reason about the prospect: one keystroke, done.
+  if (_desk.mode === 'approve' || choice.stops_prospect) { deskConfirm(); return; }
+  renderDesk_();
+  const note = document.getElementById('reject-note');
+  if (note) note.focus();
+}
+
+async function deskConfirm() {
+  const cur = _desk.items[_desk.i];
+  if (!cur) return;
+  if (_desk.mode === 'approve') {
+    const t = _review.approve_tags[_desk.pick];
+    return outboxAct(cur.id, 'approve', t ? {tag: t.key} : {});
+  }
+  if (_desk.mode === 'reject') {
+    const r = _review.reject_reasons[_desk.pick];
+    if (!r) { showToast('Pick a reason (1-' + _review.reject_reasons.length + ').', 'error'); return; }
+    const el = document.getElementById('reject-note');
+    const note = el ? el.value.trim() : '';
+    if (r.key === 'other' && !note) { showToast('Say a few words about why.', 'error'); if (el) el.focus(); return; }
+    return outboxAct(cur.id, 'reject', {reason: r.key, note: note});
+  }
+}
+
+function deskRejectNoReason() {
+  const cur = _desk.items[_desk.i];
+  if (cur) outboxAct(cur.id, 'reject', {});
+}
+
+// ── Rewrite in your style ──
+// Comes back as an edit to read and save; nothing is saved or approved here.
+async function deskRewrite(id) {
+  if (_desk.mode === 'rewriting') return;
+  if (_desk.editing && _desk.editing !== id) { deskBusy(); return; }
+  const steer = document.getElementById('desk-rw-note');
+  const instruction = steer ? steer.value.trim() : '';
+  const wasEditing = _desk.editing === id;
+  _desk.mode = 'rewriting';
+  renderDesk_();
+  let data = null;
+  try {
+    data = await api('/api/outbox/' + encodeURIComponent(id) + '/rewrite', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({instruction: instruction}),
+    });
+  } finally {
+    _desk.mode = null;
+  }
+  if (!data || !data.success) {
+    showToast(failMsg(data, 'The rewrite failed.'), 'error');
+    renderDesk_();
+    return;
+  }
+  _desk.editing = id;
+  _desk.unsaved = {subject: data.subject, body: data.body};
+  _desk.rewrite = {id: id, changes: data.changes, learned_from: data.learned_from};
+  renderDesk_();
+  if (!wasEditing) document.getElementById('desk-body').focus();
+}
+
+async function outboxAct(id, action, body) {
   if (deskBusy()) return;
-  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
-  if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
-  else showToast(failMsg(data, 'Action failed.'), 'error');
+  _desk.mode = null;
+  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {}),
+  });
+  if (data && data.success) {
+    let msg;
+    if (action === 'approve') {
+      msg = 'Approved' + (body && body.tag ? ' as ' + tagLabel(body.tag) : '') + '. It sends on schedule.';
+    } else {
+      msg = 'Rejected' + (body && body.reason ? ': ' + reasonLabel(body.reason) : '') + '.' +
+        (data.cancelled ? ' ' + data.cancelled + ' more queued email' + (data.cancelled === 1 ? '' : 's') +
+          ' to ' + (body.reason === 'not_a_fit' ? 'this company' : 'this contact') + ' cancelled too.' : '');
+    }
+    showToast(msg, 'success');
+  } else showToast(failMsg(data, 'Action failed.'), 'error');
   loadOutbox();
 }
 

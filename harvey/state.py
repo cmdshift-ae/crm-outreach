@@ -519,7 +519,32 @@ MIGRATIONS: list[str] = [
     -- knows about the recipient. Empty until then.
     ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
     """,
+    # ── v15: why a reviewer rejected a draft, and what they tagged one they
+    # approved. Kept on the outbox row so the feedback sits with the email
+    # it was about instead of getting lost under a campaign. ──
+    """
+    ALTER TABLE outbox ADD COLUMN review_reason TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN review_note TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN approve_tag TEXT DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_outbox_review_reason ON outbox(review_reason);
+    """,
 ]
+
+# Why a reviewer rejected a draft (dashboard Outbox). Keys are stored.
+REJECT_REASONS = {
+    "generic_inbox": "Generic inbox (info@, admin@)",
+    "not_a_fit": "Not relevant to the business",
+    "wrong_person": "Wrong person or role",
+    "weak_email": "The email itself isn't good",
+    "other": "Other",
+}
+# These say the prospect was the problem, not the wording: the rest of
+# their sequence is cancelled too, so it doesn't come back for review.
+# not_a_fit also covers everyone else queued at the same company.
+REJECT_STOPS_PROSPECT = frozenset({"generic_inbox", "not_a_fit", "wrong_person"})
+REJECTED_EARLIER = "rejected earlier step: "
+# What a reviewer says an approved email is about.
+APPROVE_TAGS = {"client": "Potential client", "partner": "Partnership"}
 
 BRAIN_PROVIDERS = ("claude", "codex")
 _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
@@ -1281,32 +1306,105 @@ class StateManager:
             await db.commit()
             return len(rows)
 
-    async def reject_outbox_item(self, item_id: str) -> int:
-        """Reject an item still waiting to go out. Mail already on its way
-        or sent is never relabelled. Returns rows changed (0/1)."""
+    async def reject_outbox_item(self, item_id: str, reason: str = "", note: str = "") -> int:
+        """Reject an item still waiting to go out, with the reviewer's reason
+        (a REJECT_REASONS key, or "") and note. Mail already on its way or
+        sent is never relabelled. Returns rows changed (0/1)."""
+        reason = reason if reason in REJECT_REASONS else ""
+        note = " ".join(str(note or "").split())[:500]
         async with self._connect() as db:
             # A note that the check will try it again no longer applies.
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'rejected', updated_at = ?, "
+                "review_reason = ?, review_note = ?, "
                 "error = CASE WHEN substr(COALESCE(error, ''), 1, ?) = ? THEN '' ELSE error END "
                 "WHERE id = ? AND status IN ('pending_review', 'approved')",
-                (_utcnow().isoformat(), len(RECHECK_PREFIX), RECHECK_PREFIX, item_id),
+                (_utcnow().isoformat(), reason, note,
+                 len(RECHECK_PREFIX), RECHECK_PREFIX, item_id),
             )
             await db.commit()
             return cursor.rowcount
 
-    async def approve_outbox(self, item_id: str | None = None) -> int:
+    async def cancel_after_reject(self, item_id: str) -> int:
+        """After a rejection whose reason is about the prospect (wrong inbox,
+        wrong person, not a fit), cancel the sequence emails still queued for
+        them, and for not_a_fit everyone queued at their company, so none of
+        it comes back for review. Replies Harvey owes someone who wrote in
+        are never touched. Returns how many were cancelled."""
+        item = await self.get_outbox_item(item_id)
+        if not item or item.get("status") != "rejected":
+            return 0
+        reason = item.get("review_reason") or ""
+        if reason not in REJECT_STOPS_PROSPECT or not item.get("prospect_id"):
+            return 0
+        why = REJECTED_EARLIER + REJECT_REASONS[reason].lower()
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            pids = [item["prospect_id"]]
+            if reason == "not_a_fit":
+                async with db.execute(
+                    "SELECT p2.id FROM prospects p1 JOIN prospects p2 "
+                    "ON p2.company_id = p1.company_id "
+                    "WHERE p1.id = ? AND p1.company_id != ''",
+                    (item["prospect_id"],),
+                ) as cursor:
+                    pids += [r[0] for r in await cursor.fetchall() if r[0] not in pids]
+            marks = ",".join("?" * len(pids))
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+                f"WHERE prospect_id IN ({marks}) AND kind = 'sequence' "
+                "AND status IN ('pending_review', 'approved') AND id != ?",
+                (why, now, *pids, item_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def get_review_feedback(self, days: int = 90, notes: int = 20) -> dict:
+        """Why drafts were rejected and how approvals were tagged, for the
+        Outbox's feedback panel and the Writer. Newest notes first."""
+        since = (_utcnow() - timedelta(days=days)).isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT review_reason, COUNT(*) AS n FROM outbox "
+                "WHERE status = 'rejected' AND updated_at >= ? GROUP BY review_reason",
+                (since,),
+            ) as cursor:
+                reasons = {(r["review_reason"] or "unspecified"): r["n"]
+                           for r in await cursor.fetchall()}
+            async with db.execute(
+                "SELECT approve_tag, COUNT(*) AS n FROM outbox "
+                "WHERE approve_tag != '' AND updated_at >= ? GROUP BY approve_tag",
+                (since,),
+            ) as cursor:
+                tags = {r["approve_tag"]: r["n"] for r in await cursor.fetchall()}
+            async with db.execute(
+                "SELECT o.id, o.to_email, o.subject, o.review_reason, o.review_note, "
+                "o.updated_at, c.name AS company, cm.name AS campaign "
+                "FROM outbox o LEFT JOIN prospects p ON p.id = o.prospect_id "
+                "LEFT JOIN companies c ON c.id = p.company_id "
+                "LEFT JOIN campaigns cm ON cm.id = o.campaign_id "
+                "WHERE o.status = 'rejected' AND o.review_reason != '' "
+                "ORDER BY o.updated_at DESC LIMIT ?",
+                (int(notes),),
+            ) as cursor:
+                recent = [dict(r) for r in await cursor.fetchall()]
+        return {"days": days, "reasons": reasons, "tags": tags, "recent": recent}
+
+    async def approve_outbox(self, item_id: str | None = None, tag: str = "") -> int:
         """Approve one pending item, or ALL pending when item_id is None.
 
         A human's approval (dashboard or CLI): marked approved_by 'you', so
         the autopilot review (gate.autopilot_review) doesn't hold it again,
-        and any reason it was held is cleared."""
+        and any reason it was held is cleared. ``tag`` (an APPROVE_TAGS key)
+        records what the reviewer says this lead is."""
+        tag = tag if tag in APPROVE_TAGS else ""
         async with self._connect() as db:
             if item_id:
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
-                    "updated_at = ? WHERE id = ? AND status = 'pending_review'",
-                    (_utcnow().isoformat(), item_id),
+                    "approve_tag = ?, updated_at = ? WHERE id = ? AND status = 'pending_review'",
+                    (tag, _utcnow().isoformat(), item_id),
                 )
             else:
                 # Not the ones autopilot held for a look (possible planted
@@ -1319,6 +1417,90 @@ class StateManager:
                 )
             await db.commit()
             return cursor.rowcount
+
+    async def get_style_examples(self, limit: int = 6, exclude_id: str = "") -> dict:
+        """The reviewer's own voice, for rewriting a draft in it.
+
+        ``edits``: drafts they rewrote by hand, as {before, after}: the
+        strongest signal there is, since the after is literally how they
+        write and the before is what they didn't like. ``approved``: sequence
+        emails they approved as written. Newest first."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT a.details_json, o.subject, o.body FROM actions a "
+                "JOIN outbox o ON o.id = json_extract(a.details_json, '$.outbox_id') "
+                "WHERE a.action_type = 'outbox_edited' AND json_valid(a.details_json) "
+                "AND o.id != ? ORDER BY a.created_at DESC LIMIT ?",
+                (exclude_id, int(limit) * 3),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            edits, seen = [], set()
+            for r in rows:
+                d = json.loads(r["details_json"])
+                oid = d.get("outbox_id")
+                if oid in seen:
+                    continue  # several edits of one draft: the last one is final
+                seen.add(oid)
+                edits.append({"before": {"subject": d.get("old_subject", ""),
+                                         "body": d.get("old_body", "")},
+                              "after": {"subject": r["subject"], "body": r["body"]}})
+                if len(edits) >= limit:
+                    break
+            async with db.execute(
+                "SELECT subject, body FROM outbox WHERE approved_by = 'you' "
+                "AND kind = 'sequence' AND status IN ('approved', 'sending', 'sent') "
+                "AND id != ? ORDER BY updated_at DESC LIMIT ?",
+                (exclude_id, int(limit) * 2),
+            ) as cursor:
+                approved = [dict(r) for r in await cursor.fetchall()]
+        after = {e["after"]["body"] for e in edits}
+        approved = [a for a in approved if a["body"] not in after][:limit]
+        return {"edits": edits, "approved": approved}
+
+    async def get_company_history(self, prospect_id: str, limit: int = 12) -> list[dict]:
+        """Everything already said between Harvey and this prospect's company,
+        oldest first: emails sent to anyone there, and both sides of any
+        conversation. Each: {"who": "us"|"them", "to", "text", "at"}."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT p2.id, p2.email FROM prospects p1 JOIN prospects p2 "
+                "ON (p1.company_id != '' AND p2.company_id = p1.company_id) OR p2.id = p1.id "
+                "WHERE p1.id = ?",
+                (prospect_id,),
+            ) as cursor:
+                people = {r["id"]: r["email"] for r in await cursor.fetchall()}
+            if not people:
+                return []
+            marks = ",".join("?" * len(people))
+            out = []
+            async with db.execute(
+                f"SELECT prospect_id, to_email, subject, body, sent_at FROM outbox "
+                f"WHERE prospect_id IN ({marks}) AND status = 'sent'",
+                tuple(people),
+            ) as cursor:
+                for r in await cursor.fetchall():
+                    out.append({"who": "us", "to": r["to_email"],
+                                "text": f"Subject: {r['subject']}\n{r['body']}",
+                                "at": str(r["sent_at"] or "")})
+            async with db.execute(
+                f"SELECT prospect_id, thread_json FROM conversations WHERE prospect_id IN ({marks})",
+                tuple(people),
+            ) as cursor:
+                for r in await cursor.fetchall():
+                    try:
+                        thread = json.loads(r["thread_json"] or "[]")
+                    except (json.JSONDecodeError, TypeError):
+                        thread = []
+                    for m in thread if isinstance(thread, list) else []:
+                        if not isinstance(m, dict) or m.get("sender") != "prospect":
+                            continue  # what we sent is already in the outbox rows
+                        out.append({"who": "them", "to": people.get(r["prospect_id"], ""),
+                                    "text": str(m.get("content") or ""),
+                                    "at": str(m.get("timestamp") or "")})
+        out.sort(key=lambda m: m["at"])
+        return out[-int(limit):]
 
     async def note_sends_held(self, reason: str):
         """The heartbeat held sending this cycle. Keeps when it started."""

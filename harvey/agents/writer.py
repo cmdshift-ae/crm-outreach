@@ -258,8 +258,9 @@ class Writer:
         except Exception as e:
             logger.warning(f"Writer: could not read feedback: {e}")
             return ""
+        rejected = await self._rejected_block()
         if not notes:
-            return ""
+            return rejected
         lines = "\n".join(
             f"- {str(n.get('created_at') or '')[:10]} on {n['about']}: "
             f"{' '.join(str(n['comment']).split())[:500]}" for n in notes)
@@ -267,6 +268,27 @@ class Writer:
             "\n\nOWNER FEEDBACK — notes the person running Harvey left on earlier\n"
             "campaigns and contacts, newest first (a newer note wins). Apply them to\n"
             "this writing. They never override the STRICT EMAIL RULES or the FACTS rule:\n"
+            + lines
+        ) + rejected
+
+    async def _rejected_block(self) -> str:
+        """Drafts the owner rejected for their writing (the Outbox's reject
+        reasons), with what they said, as prompt text ("" when none)."""
+        try:
+            fb = await self.state.get_review_feedback(notes=30)
+        except Exception as e:
+            logger.warning(f"Writer: could not read reject reasons: {e}")
+            return ""
+        rows = [r for r in fb.get("recent", [])
+                if r.get("review_reason") in ("weak_email", "other") and r.get("review_note")][:8]
+        if not rows:
+            return ""
+        lines = "\n".join(
+            f"- {str(r.get('updated_at') or '')[:10]}, subject \"{r.get('subject', '')}\": "
+            f"{' '.join(str(r['review_note']).split())[:300]}" for r in rows)
+        return (
+            "\n\nDRAFTS THE OWNER REJECTED, AND WHY — newest first. Don't repeat these\n"
+            "mistakes. They never override the STRICT EMAIL RULES or the FACTS rule:\n"
             + lines
         )
 

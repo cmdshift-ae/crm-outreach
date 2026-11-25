@@ -729,6 +729,34 @@ details[open] > summary::before { rotate: 45deg; }
 .banner.bad { background: var(--bad-bg); color: var(--bad); border-color: var(--bad-line); }
 .banner.wait { background: var(--wait-bg); color: var(--wait); border-color: var(--wait-line); }
 .banner p { color: var(--text-2); }
+.banner.good { background: var(--good-bg); color: var(--good); border-color: var(--good-line); }
+.banner.good .muted { color: var(--text-2); }
+
+/* Outbox: reject reasons, approve tags, rewrite */
+.desk-actions.picking { display: block; }
+.picker-q { font-size: var(--fs-body); font-weight: 500; margin-bottom: var(--sp-3); }
+.pick-chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.pick-chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; cursor: pointer;
+  font: inherit; font-size: var(--fs-ui); color: var(--text); background: var(--surface);
+  border: 1px solid var(--line-strong); border-radius: var(--r-md);
+}
+@media (hover: hover) { .pick-chip:hover { background: var(--surface-2); } }
+.pick-chip.on { background: var(--accent-soft); border-color: var(--accent); }
+.picker textarea { margin-top: var(--sp-3); max-width: 66ch; width: 100%; }
+.picker-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); flex-wrap: wrap; }
+.desk-rewrite { margin-top: var(--sp-4); }
+.desk-rewrite-again { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); max-width: 66ch; }
+.desk-rewrite-again .form-input { flex: 1; min-width: 0; }
+.fb-card { padding: var(--sp-4); margin-bottom: var(--sp-3); }
+.fb-bars { display: grid; gap: 6px; max-width: 560px; }
+.fb-row { display: grid; grid-template-columns: 220px 1fr 32px; gap: var(--sp-3); align-items: center; font-size: var(--fs-ui); }
+.fb-row b { text-align: right; font-variant-numeric: tabular-nums; }
+.fb-bar { height: 8px; background: var(--surface-3); border-radius: 4px; overflow: hidden; }
+.fb-bar i { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.fb-tags { margin-top: var(--sp-3); display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; font-size: var(--fs-ui); }
+.fb-hint { margin-top: var(--sp-3); font-size: var(--fs-ui); }
+@media (max-width: 640px) { .fb-row { grid-template-columns: 1fr 60px 28px; } }
 
 /* ── Discover ────────────────────────────────────────────────── */
 
