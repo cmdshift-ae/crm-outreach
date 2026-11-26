@@ -980,6 +980,17 @@ async def _with_context(items: list[dict]) -> list[dict]:
 
     company_ids = sorted({p["company_id"] for p in people.values() if p.get("company_id")})
     seqs = await _sequences(pids)
+    fits: dict[str, dict] = {}
+    fit_keys = sorted({(people.get(i)or {}).get("company_id") or f"p:{i}" for i in pids})
+    if fit_keys:
+        from harvey.fit import FIT_PREFIX
+        for r in await query_db(
+                f"SELECT key, value FROM settings WHERE key IN ({_in(fit_keys)})",
+                tuple(FIT_PREFIX + k for k in fit_keys)):
+            try:
+                fits[r["key"][len(FIT_PREFIX):]] = json.loads(r["value"])
+            except (json.JSONDecodeError, TypeError):
+                pass
     tags: dict[str, str] = {}
     if company_ids:
         for r in await query_db(
@@ -1041,6 +1052,9 @@ async def _with_context(items: list[dict]) -> list[dict]:
             "tag": tags.get(p.get("company_id"), ""),
             # Every step of their sequence: what went, what waits, what's next.
             "sequence": seqs.get(item.get("prospect_id"), []),
+            "company_id": p.get("company_id", ""),
+            # Why they fit your company (harvey.fit), when already worked out.
+            "fit": fits.get(p.get("company_id") or f"p:{item.get('prospect_id')}"),
         }
     return items
 
@@ -1203,6 +1217,104 @@ async def outbox_approve(item_id: str, request: Request):
             await state.log_action("outbox_tagged", "dashboard",
                                    {"outbox_id": item_id, "tag": tag})
         return {"success": bool(n)}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+# ── Your company, and why a prospect fits it (harvey.fit) ──
+
+def _profile_path():
+    from harvey.brain import SKILLS_DIR
+    from harvey.fit import PROFILE_SKILL
+    return SKILLS_DIR / f"{PROFILE_SKILL}.md"
+
+
+@app.get("/api/company-profile")
+async def get_company_profile():
+    """What Harvey knows about your company: the file the Writer and Handler
+    read before every email. A starter when training never wrote one."""
+    from harvey.config import load_config
+    from harvey.fit import starter_profile
+    from harvey.textio import read_user_text
+    path = _profile_path()
+    try:
+        return {"exists": True, "text": read_user_text(path),
+                "updated_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()}
+    except FileNotFoundError:
+        try:
+            config = load_config(str(_resolve_config_file()))
+        except Exception:
+            config = None
+        return {"exists": False, "text": starter_profile(config), "updated_at": None}
+
+
+@app.post("/api/company-profile")
+async def save_company_profile(request: Request):
+    """Save your company profile. Every "why they fit" was judged against the
+    old one, so those are cleared and worked out again when next opened."""
+    from harvey.fit import PROFILE_MAX_CHARS, clear_fits
+    text = str((await _json_body(request)).get("text") or "").replace("\r\n", "\n").strip()
+    if len(text) < 40:
+        return _refuse("Write a few lines about your company first.", 400)
+    if len(text) > PROFILE_MAX_CHARS:
+        return _refuse(f"Keep it under {PROFILE_MAX_CHARS:,} characters: it goes into every email prompt.", 400)
+    path = _profile_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".md.tmp")
+        tmp.write_text(text + "\n", encoding="utf-8")
+        tmp.replace(path)
+        state = _state()
+        await state.init_db()
+        cleared = await clear_fits(state)
+        await state.log_action("company_profile_saved", "dashboard",
+                               {"chars": len(text), "fits_cleared": cleared})
+        return {"success": True, "fits_cleared": cleared}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+def _company_key(context_or_item: dict, prospect_id: str = "") -> str:
+    cid = context_or_item.get("company_id") or ""
+    return cid or (f"p:{prospect_id}" if prospect_id else "")
+
+
+@app.post("/api/outbox/{item_id}/fit")
+async def outbox_fit(item_id: str, request: Request):
+    """Why this draft's company fits yours. Cached per company; {"refresh": true} redoes it."""
+    from harvey.brain import Brain
+    from harvey.config import load_config
+    from harvey.fit import build_fit_prompt, cached_fit, parse_fit, save_fit
+    from harvey.textio import read_user_text
+    refresh = bool((await _json_body(request)).get("refresh"))
+    try:
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if not item:
+            return _refuse("No such email.", 404)
+        context = ((await _with_context([dict(item)]))[0].get("context") or {})
+        key = _company_key(context, item.get("prospect_id") or "")
+        if not key:
+            return _refuse("Harvey doesn't know which company this email is for.")
+        if not refresh:
+            hit = await cached_fit(state, key)
+            if hit:
+                return {"success": True, "fit": hit, "cached": True}
+        try:
+            profile = read_user_text(_profile_path())
+        except FileNotFoundError:
+            return _refuse("Tell Harvey about your company first: Settings → Your company.")
+        config = load_config(str(_resolve_config_file()))
+        brain = Brain(state, config.brain)
+        result = await brain.think_json(build_fit_prompt(profile, context),
+                                        session_id="harvey-fit", agent="writer", task="company_fit")
+        fit = parse_fit(result)
+        if not fit:
+            why = brain.paused_reason or getattr(brain, "last_error", "") or "no usable answer"
+            return _refuse(f"Couldn't work out the fit ({why}).", 502)
+        await save_fit(state, key, fit)
+        return {"success": True, "fit": fit, "cached": False}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 

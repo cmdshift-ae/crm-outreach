@@ -330,6 +330,13 @@ class Writer:
                 )
         if prospect.personalization_notes:
             facts.append(f"- Research notes: {prospect.personalization_notes}")
+        # Why they fit, when the owner's dashboard already worked it out.
+        try:
+            from harvey.fit import cached_fit, fit_lines
+            facts.extend(fit_lines(await cached_fit(
+                self.state, prospect.company_id or f"p:{prospect.id}")))
+        except Exception as e:
+            logger.warning(f"Writer: could not read the company fit: {e}")
         startup = await self._startup(prospect.company_id)
         if startup is not None:
             facts.extend(startup)

@@ -1253,6 +1253,7 @@ function pageCohort(dir) {
 // ── Settings ──
 
 async function loadSettings() {
+  loadCompanyProfile();
   const data = await api('/api/settings');
   if (!data) return;
 
@@ -2148,7 +2149,7 @@ function renderDesk(items, i) {
       '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b>' +
         '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
         (_desk.view === 'rejected' ? '' : '<span class="muted">sends ' + formatDate(cur.send_at) + '</span>') + '</div>' +
-      renderDeskContext(cur.context) +
+      renderDeskContext(cur.context) + renderFit(cur) +
       (_desk.view === 'rejected' ? renderRejectedPane(cur) : reviewPane) +
     '</div></div>';
 }
@@ -2367,6 +2368,84 @@ async function deskRewrite(id) {
   _desk.rewrite = {id: id, changes: data.changes, learned_from: data.learned_from};
   renderDesk_();
   if (!wasEditing) document.getElementById('desk-body').focus();
+}
+
+// ── Why they fit your company ──
+// Claude's read of the prospect against Settings → Your company, worked out
+// once per company when its draft is first opened, then kept.
+const _fits = {};   // company key -> {loading, error, fit}
+
+function fitKey(cur) {
+  const ctx = cur.context || {};
+  return ctx.company_id || (cur.prospect_id ? 'p:' + cur.prospect_id : '');
+}
+
+function renderFit(cur) {
+  const key = fitKey(cur);
+  if (!key) return '';
+  const st = _fits[key] || {};
+  const fit = st.fit || (cur.context && cur.context.fit);
+  if (!fit && !st.loading && !st.error) setTimeout(() => loadFit(cur.id, key, false), 0);
+  const head = '<div class="fit-head"><b>Why they fit</b>' +
+    (fit ? ' <span class="tag fit-' + escHtml(fit.score) + '">' + escHtml({strong: 'Strong fit', possible: 'Possible fit', weak: 'Weak fit'}[fit.score] || fit.score) + '</span>' : '') +
+    (fit || st.error ? '<button class="link-btn" onclick="loadFit(' + jsq(cur.id) + ',' + jsq(key) + ',true)"' + (st.loading ? ' disabled' : '') + '>' +
+      (st.loading ? 'Working…' : fit ? 'Refresh' : 'Try again') + '</button>' : '') + '</div>';
+  let body;
+  if (fit) {
+    body = '<div class="fit-row"><span class="k">What they do</span><span>' + escHtml(fit.summary) + '</span></div>' +
+      '<div class="fit-row"><span class="k">Why us</span><span>' + escHtml(fit.fit) + '</span></div>' +
+      (fit.angle ? '<div class="fit-row"><span class="k">Best angle</span><span>' + escHtml(fit.angle) + '</span></div>' : '');
+  } else if (st.error) {
+    const toSettings = /Your company/.test(st.error);
+    body = '<p class="muted">' + escHtml(st.error) + (toSettings
+      ? ' <button class="link-btn" onclick="showTab(\'settings\', document.querySelector(\'nav button[onclick*=settings]\'))">Open Settings</button>' : '') + '</p>';
+  } else {
+    body = '<p class="muted">Working out how they fit your company… this takes a few seconds.</p>';
+  }
+  return '<div class="desk-fit">' + head + body + '</div>';
+}
+
+async function loadFit(itemId, key, refresh) {
+  if ((_fits[key] || {}).loading) return;
+  _fits[key] = {loading: true, fit: (_fits[key] || {}).fit};
+  if (refresh) renderDeskArea();
+  const data = await api('/api/outbox/' + encodeURIComponent(itemId) + '/fit', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({refresh: !!refresh}),
+  });
+  _fits[key] = data && data.success ? {fit: data.fit}
+    : {error: failMsg(data, 'Couldn\'t work out the fit.'), fit: (_fits[key] || {}).fit};
+  const cur = _desk.items[_desk.i];
+  if (cur && fitKey(cur) === key && !_desk.editing) renderDeskArea();
+}
+
+// ── Settings: your company ──
+let _profileDirty = false;
+
+async function loadCompanyProfile() {
+  const el = document.getElementById('company-profile');
+  if (!el || _profileDirty) return;
+  const d = await api('/api/company-profile');
+  if (!d || d.error) return;
+  el.value = d.text || '';
+  const note = document.getElementById('company-profile-note');
+  if (note) note.textContent = d.exists
+    ? 'Last saved ' + formatDate(d.updated_at) + '.'
+    : 'Not saved yet: this is a starting point built from your settings. Fill it in and save.';
+}
+
+async function saveCompanyProfile() {
+  const el = document.getElementById('company-profile');
+  if (!el) return;
+  const data = await api('/api/company-profile', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: el.value}),
+  });
+  if (data && data.success) {
+    _profileDirty = false;
+    for (const k of Object.keys(_fits)) delete _fits[k];
+    showToast('Saved. Harvey writes with it from now on' +
+      (data.fits_cleared ? ', and works out each company\'s fit again when you open its draft.' : '.'), 'success');
+    loadCompanyProfile();
+  } else showToast(failMsg(data, 'Couldn\'t save your company profile.'), 'error');
 }
 
 // ── Why you rejected it: a side panel ──
