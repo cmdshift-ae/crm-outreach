@@ -307,3 +307,39 @@ def test_the_providers_own_error_reaches_the_reviewer(client, monkeypatch):
     monkeypatch.setattr("harvey.brain.Brain.think_json", failed)
     r = client.post(f"/api/outbox/{items[('ops', 1)]}/rewrite", json={})
     assert "529 overloaded" in r.json()["message"]
+
+
+# ── Adding a reason after the fact ──
+
+def test_a_reason_can_be_added_to_an_email_rejected_without_one(client):
+    state, items = asyncio.run(_seed(client.db_path))
+    client.post(f"/api/outbox/{items[('ops', 1)]}/reject")
+    failed = client.get("/api/outbox").json()["failed"]
+    row = next(r for r in failed if r["id"] == items[("ops", 1)])
+    assert row["review_reason"] == "" and row["context"]["company"] == "Acme Fitouts"
+    r = client.post(f"/api/outbox/{items[('ops', 1)]}/reason",
+                    json={"reason": "weak_email", "note": "lead with their fit-out work"})
+    assert r.json()["success"]
+    item = asyncio.run(state.get_outbox_item(items[("ops", 1)]))
+    assert (item["review_reason"], item["review_note"]) == ("weak_email", "lead with their fit-out work")
+    fb = client.get("/api/outbox/feedback").json()
+    assert fb["reasons"] == {"weak_email": 1}
+
+
+def test_changing_to_a_prospect_reason_clears_their_queue(client):
+    state, items = asyncio.run(_seed(client.db_path))
+    client.post(f"/api/outbox/{items[('inbox', 1)]}/reject")
+    assert _status(state, items[("inbox", 2)]) == "cancelled"   # can't go without email 1
+    r = client.post(f"/api/outbox/{items[('inbox', 1)]}/reason", json={"reason": "not_a_fit"})
+    assert r.json()["cancelled"] == 3                              # the colleague's sequence
+    assert _status(state, items[("ops", 1)]) == "cancelled"
+    assert _status(state, items[("globex", 1)]) == "pending_review"
+
+
+def test_a_reason_needs_a_rejected_email_and_a_known_reason(client):
+    _, items = asyncio.run(_seed(client.db_path))
+    assert client.post(f"/api/outbox/{items[('ops', 1)]}/reason",
+                       json={"reason": "weak_email"}).status_code == 409
+    client.post(f"/api/outbox/{items[('ops', 1)]}/reject")
+    assert client.post(f"/api/outbox/{items[('ops', 1)]}/reason", json={"reason": "spite"}).status_code == 400
+    assert client.post(f"/api/outbox/{items[('ops', 1)]}/reason", json={"reason": "other"}).status_code == 400

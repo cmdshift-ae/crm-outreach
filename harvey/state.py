@@ -1325,6 +1325,20 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
+    async def set_reject_reason(self, item_id: str, reason: str, note: str = "") -> int:
+        """Add or change the reason on an email already rejected. Rows changed (0/1)."""
+        if reason not in REJECT_REASONS:
+            return 0
+        note = " ".join(str(note or "").split())[:500]
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET review_reason = ?, review_note = ?, updated_at = updated_at "
+                "WHERE id = ? AND status = 'rejected'",
+                (reason, note, item_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
     async def cancel_after_reject(self, item_id: str) -> int:
         """After a rejection, cancel the later emails in that sequence (they
         can't go without it). When the reason is about the prospect (wrong

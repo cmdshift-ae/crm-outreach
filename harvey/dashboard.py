@@ -1080,7 +1080,7 @@ async def get_outbox_api():
             "sent": await _with_next_step(await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
-            "failed": (await query_db(
+            "failed": await _with_context(await query_db(
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25")),
         }
@@ -1203,6 +1203,35 @@ async def outbox_approve(item_id: str, request: Request):
             await state.log_action("outbox_tagged", "dashboard",
                                    {"outbox_id": item_id, "tag": tag})
         return {"success": bool(n)}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/reason")
+async def outbox_reason(item_id: str, request: Request):
+    """Add or change why you rejected an email. Body: {"reason": <key>, "note": "..."}.
+    The Writer reads the notes; a reason about the prospect also cancels
+    what's still queued for them, as it does when rejecting."""
+    from harvey.state import REJECT_REASONS
+    body = await _json_body(request)
+    reason = str(body.get("reason") or "")
+    note = " ".join(str(body.get("note") or "").split())
+    if reason not in REJECT_REASONS:
+        return _refuse("Pick a reason: " + ", ".join(REJECT_REASONS), 400)
+    if reason == "other" and not note:
+        return _refuse("Say a few words about why, so Harvey can learn from it.", 400)
+    try:
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if not await state.set_reject_reason(item_id, reason, note):
+            return _refuse("Only rejected emails can have a reject reason.")
+        cancelled = await state.cancel_after_reject(item_id)
+        await state.log_action("outbox_reason_set", "dashboard", {
+            "outbox_id": item_id, "reason": reason, "note": note[:500],
+            "old_reason": (item or {}).get("review_reason", ""),
+            "old_note": (item or {}).get("review_note", ""), "cancelled": cancelled})
+        return {"success": True, "cancelled": cancelled}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 

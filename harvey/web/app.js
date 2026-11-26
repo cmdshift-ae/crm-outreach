@@ -6,6 +6,8 @@ let _signals = null;           // last /api/signals payload, for the cohort buil
 let _desk = { items: [], i: 0, view: 'pending', pending: [], followups: [], rejected: [] };
 // Reject reasons and approve tags, from /api/outbox/review-options.
 let _review = null;
+// Rejected emails by id (Didn't send + Rejected tab), for the reason panel.
+let _rejectedById = {};
 
 // ── Appearance ──
 //
@@ -1650,6 +1652,8 @@ async function loadOutbox() {
   _desk.pending = pending;
   _desk.followups = data.followups || [];
   _desk.rejected = data.rejected || [];
+  _rejectedById = {};
+  for (const r of (data.failed || []).concat(_desk.rejected)) if (r.status === 'rejected') _rejectedById[r.id] = r;
   if (_desk.focus) {   // a draft just brought back: open it where it now waits
     const inFollowups = _desk.followups.some(p => p.id === _desk.focus);
     _desk.view = inFollowups ? 'followups' : 'pending';
@@ -1697,13 +1701,13 @@ async function loadOutbox() {
 
   renderDeskArea();
 
-  const table = (title, rows, cols) => {
+  const table = (title, rows, cols, rowAttr) => {
     if (!rows || !rows.length) return '';
     let h = '<div class="subhead">' + title + ' <span class="hint">' + rows.length + '</span></div>' +
       '<div class="table-card"><table class="nowrap clip"><thead><tr>' +
       cols.map(c => '<th>' + c[0] + '</th>').join('') + '</tr></thead><tbody>';
     for (const r of rows) {
-      h += '<tr>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
+      h += '<tr' + (rowAttr ? rowAttr(r) : '') + '>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
         (c[3] ? c[1](r) : escHtml(String(c[1](r) ?? ''))) + '</td>').join('') + '</tr>';
     }
     return h + '</tbody></table></div>';
@@ -1722,10 +1726,12 @@ async function loadOutbox() {
     ]) +
     table('Didn\'t send', data.failed, [
       ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
-      ['Reason', r => r.review_reason ? reasonLabel(r.review_reason) +
-        (r.review_note ? ': ' + r.review_note : '') : r.error, true],
+      ['Reason', r => r.review_reason ? escHtml(reasonLabel(r.review_reason) + (r.review_note ? ': ' + r.review_note : ''))
+        : r.status === 'rejected' ? '<span class="add-reason">Add your reason</span>' : escHtml(r.error || ''), true, true],
       ['Updated', r => formatDate(r.updated_at), true],
-    ]) + renderReviewFeedback(feedback);
+    ], r => r.status === 'rejected'
+      ? ' class="row-click" tabindex="0" title="Add or change why you rejected it" onclick="openReasonPanel(' + jsq(r.id) + ')" ' +
+        'onkeydown="if(event.key===\'Enter\')openReasonPanel(' + jsq(r.id) + ')"' : '') + renderReviewFeedback(feedback);
 }
 
 function reasonLabel(key) {
@@ -1999,7 +2005,9 @@ function renderRejectedPane(cur) {
   const busy = _desk.mode === 'rewriting';
   return '<div class="banner bad desk-held">' + icon('alert') + '<div><b>You rejected this ' +
       formatDate(cur.updated_at) + '</b><div>' + escHtml(why) +
-      (cur.review_note ? ': ' + escHtml(cur.review_note) : '') + '</div></div></div>' +
+      (cur.review_note ? ': ' + escHtml(cur.review_note) : '') +
+      ' <button class="link-btn" onclick="openReasonPanel(' + jsq(cur.id) + ')">' +
+        (cur.review_reason ? 'Change reason' : 'Add your reason') + '</button></div></div></div>' +
     '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
     '<div class="body">' + escHtml(cur.body) + '</div>' +
     '<div class="desk-rewrite-again"><input id="desk-rw-note" class="form-input" ' +
@@ -2360,6 +2368,107 @@ async function deskRewrite(id) {
   renderDesk_();
   if (!wasEditing) document.getElementById('desk-body').focus();
 }
+
+// ── Why you rejected it: a side panel ──
+// Opened from a rejected row under Didn't send, or from the Rejected tab.
+// The reason and note teach the Writer; nothing here sends or brings back mail.
+let _rp = {id: null, pick: -1, busy: false};
+
+function openReasonPanel(id) {
+  const r = _rejectedById[id];
+  if (!r || !_review) return;
+  _rp = {id: id, pick: _review.reject_reasons.findIndex(x => x.key === r.review_reason), busy: false};
+  let scrim = document.getElementById('rpanel-scrim'), el = document.getElementById('rpanel');
+  if (!el) {
+    scrim = document.createElement('div'); scrim.id = 'rpanel-scrim'; scrim.onclick = closeReasonPanel;
+    el = document.createElement('aside'); el.id = 'rpanel'; el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-label', 'Why you rejected this email');
+    document.body.appendChild(scrim); document.body.appendChild(el);
+  }
+  renderReasonPanel();
+  scrim.classList.add('on'); el.classList.add('on');
+  const note = document.getElementById('rp-note'); if (note) note.focus();
+}
+
+function closeReasonPanel() {
+  _rp.id = null;
+  const scrim = document.getElementById('rpanel-scrim'), el = document.getElementById('rpanel');
+  if (scrim) scrim.classList.remove('on');
+  if (el) el.classList.remove('on');
+}
+
+function renderReasonPanel() {
+  const el = document.getElementById('rpanel');
+  const r = _rejectedById[_rp.id];
+  if (!el || !r) return;
+  const note = document.getElementById('rp-note');
+  const typed = note ? note.value : (r.review_note || '');
+  const ctx = r.context || {};
+  const chips = _review.reject_reasons.map((x, n) =>
+    '<button class="pick-chip' + (_rp.pick === n ? ' on' : '') + '" onclick="rpPick(' + n + ')">' + escHtml(x.label) + '</button>').join('');
+  const chosen = _review.reject_reasons[_rp.pick];
+  el.innerHTML =
+    '<div class="rp-head"><div class="rp-who"><div class="cell-main">' + escHtml(r.to_email) + '</div>' +
+      '<div class="cell-sub">' + escHtml([ctx.company, 'Email ' + r.step, 'rejected ' + formatDate(r.updated_at)].filter(Boolean).join(' · ')) + '</div></div>' +
+      '<button class="btn btn-ghost btn-sm" onclick="closeReasonPanel()" aria-label="Close">Close</button></div>' +
+    '<div class="rp-body">' +
+      '<section><div class="rp-h">Why did you reject it?</div><div class="pick-chips">' + chips + '</div>' +
+        (chosen && chosen.stops_prospect
+          ? '<p class="muted rp-hint">Saving this also cancels anything still queued for ' +
+            (chosen.key === 'not_a_fit' ? 'everyone at this company.' : 'this contact.') + '</p>' : '') + '</section>' +
+      '<section><div class="rp-h">What should Harvey learn from it?' + (chosen && chosen.key === 'other' ? ' (needed for Other)' : ' (optional)') + '</div>' +
+        '<textarea id="rp-note" class="form-input" rows="4" placeholder="For example: they\'re a consultancy, not an operator; or: too formal, lead with their fit-out work">' +
+          escHtml(typed) + '</textarea>' +
+        '<p class="muted rp-hint">Harvey reads these notes before it writes new emails, and they show under Your review feedback.</p></section>' +
+      '<div class="picker-actions"><button class="btn btn-primary" onclick="rpSave()"' + (_rp.busy ? ' disabled' : '') + '>Save reason</button>' +
+        '<button class="btn btn-secondary" onclick="rpRedraft()"' + (_rp.busy ? ' disabled' : '') +
+          ' title="Saves your reason, then writes the email again in your style and puts it back in the Outbox for review">Save and draft again</button></div>' +
+      '<section><div class="rp-h">The email you rejected</div>' +
+        '<div class="rp-subject">' + escHtml(r.subject || '(no subject)') + '</div>' +
+        '<div class="rp-email">' + escHtml(r.body || '') + '</div></section>' +
+    '</div>';
+}
+
+function rpPick(n) { _rp.pick = n; renderReasonPanel(); }
+
+async function rpSave(quiet) {
+  if (_rp.busy || !_rp.id) return false;
+  const chosen = _review.reject_reasons[_rp.pick];
+  const note = (document.getElementById('rp-note') || {}).value || '';
+  if (!chosen) { showToast('Pick a reason first.', 'error'); return false; }
+  if (chosen.key === 'other' && !note.trim()) { showToast('Say a few words about why.', 'error'); return false; }
+  _rp.busy = true; renderReasonPanel();
+  const id = _rp.id;
+  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/reason', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({reason: chosen.key, note: note.trim()}),
+  });
+  _rp.busy = false;
+  if (!data || !data.success) { showToast(failMsg(data, 'Couldn\'t save the reason.'), 'error'); renderReasonPanel(); return false; }
+  if (!quiet) showToast('Reason saved. Harvey will learn from it.' +
+    (data.cancelled ? ' ' + data.cancelled + ' queued email' + (data.cancelled === 1 ? '' : 's') + ' cancelled too.' : ''), 'success');
+  closeReasonPanel();
+  loadOutbox();
+  return true;
+}
+
+async function rpRedraft() {
+  const id = _rp.id;
+  if (!(await rpSave(true))) return;
+  showToast('Reason saved. Drafting it again in your style…', 'success');
+  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/redraft', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'rewrite'}),
+  });
+  if (!data || !data.success) { showToast(failMsg(data, 'Couldn\'t draft it again.'), 'error'); return; }
+  showToast('Drafted again and waiting for you in the Outbox.' + (data.restored > 1
+    ? ' Its ' + (data.restored - 1) + ' follow-up' + (data.restored === 2 ? '' : 's') + ' came back too.' : ''), 'success');
+  _desk.focus = id;
+  loadOutbox();
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && _rp.id) { e.preventDefault(); e.stopImmediatePropagation(); closeReasonPanel(); }
+}, true);
 
 async function outboxAct(id, action, body) {
   if (deskBusy()) return;
