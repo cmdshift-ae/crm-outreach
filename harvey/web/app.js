@@ -382,12 +382,43 @@ async function downloadCsv(path, filename, btn) {
   }
 }
 
+// Good news fades on its own. An error stays until you close it, with a
+// Copy button, so the exact message can be captured.
 function showToast(msg, type) {
+  let box = document.getElementById('toasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toasts';
+    box.setAttribute('role', 'status');
+    document.body.appendChild(box);
+  }
   const t = document.createElement('div');
-  t.className = 'toast ' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), 2600);
+  t.className = 'toast ' + (type || '');
+  const text = document.createElement('div');
+  text.className = 'toast-text';
+  text.textContent = msg;
+  t.appendChild(text);
+  if (type === 'error') {
+    const bar = document.createElement('div');
+    bar.className = 'toast-actions';
+    const copy = document.createElement('button');
+    copy.textContent = 'Copy';
+    copy.onclick = () => {
+      try { navigator.clipboard.writeText(msg).then(() => { copy.textContent = 'Copied'; }); }
+      catch { /* select the text instead */ }
+      const r = document.createRange(); r.selectNodeContents(text);
+      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    };
+    const close = document.createElement('button');
+    close.textContent = 'Close';
+    close.setAttribute('aria-label', 'Close this message');
+    close.onclick = () => t.remove();
+    bar.appendChild(copy); bar.appendChild(close);
+    t.appendChild(bar);
+  } else {
+    setTimeout(() => t.remove(), 2600);
+  }
+  box.appendChild(t);
 }
 
 function toggleVisibility(inputId) {

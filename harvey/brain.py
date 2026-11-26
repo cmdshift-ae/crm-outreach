@@ -92,6 +92,9 @@ class Brain:
         # rate limit or timeout), as opposed to a reply that wasn't valid
         # JSON. Callers that count model failures must not count outages.
         self.last_reply_empty = False
+        # Why the last call came back empty, in the provider's own words
+        # ("" after a good reply). The dashboard shows it to the reviewer.
+        self.last_error = ""
         # Codex health (unused for Claude, whose behaviour is unchanged).
         self.unavailable = ""
         self._unavailable_at = 0.0
@@ -262,6 +265,7 @@ class Brain:
         ``agent``/``task`` label the call in the usage_events ledger so the
         dashboard can attribute tokens and cost to specific work.
         """
+        self.last_error = ""
         if self.provider == "codex":
             return await self._think_codex(
                 prompt, session_id=session_id, timeout=timeout,
@@ -276,6 +280,7 @@ class Brain:
             executable = await asyncio.to_thread(claude_runtime.check_cli)
         except claude_runtime.ClaudeRuntimeError as e:
             logger.error(f"Claude call not sent: {e}")
+            self.last_error = f"Claude call not sent: {e}"
             await self._mark_unavailable(e)
             return ""
         if self.unavailable:
@@ -357,6 +362,7 @@ class Brain:
                             "Non-retryable Claude error (auth). "
                             "Run 'claude login' and restart Harvey."
                         )
+                        self.last_error = f"Claude is not signed in: {error[:300]}"
                         return ""
                     continue  # retry transient failures
 
@@ -390,6 +396,7 @@ class Brain:
                 logger.error(
                     "Claude CLI not found. Install it: https://code.claude.com/docs/en/setup"
                 )
+                self.last_error = "Claude CLI not found on this machine"
                 return ""  # not retryable
             except asyncio.CancelledError:
                 # Shutting down — kill the child so it doesn't orphan
@@ -408,6 +415,12 @@ class Brain:
             f"Brain call failed after {max_retries + 1} attempts. "
             f"Last error: {str(last_error)[:200]}"
         )
+        if last_error == "timeout":
+            self.last_error = f"no reply within {timeout:.0f}s, {max_retries + 1} tries"
+        elif last_error:
+            self.last_error = f"after {max_retries + 1} tries: {str(last_error)[:300]}"
+        else:
+            self.last_error = f"no reply after {max_retries + 1} tries"
         return ""
 
     async def _think_codex(

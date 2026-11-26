@@ -1294,8 +1294,10 @@ async def _rewrite(state, item: dict, instruction: str) -> dict | None:
     if why:
         raise RewriteError(f"{brain.provider_label} isn't available right now: {why}.")
     if brain.last_reply_empty:
-        raise RewriteError(f"{brain.provider_label} didn't answer. It may be logged out, at its usage "
-                           "limit, or slow; check Usage, or try again in a minute.")
+        detail = getattr(brain, "last_error", "") or ""
+        raise RewriteError(f"{brain.provider_label} didn't answer" +
+                           (f" ({detail})." if detail else ". It may be logged out, at its usage "
+                            "limit, or slow; check Usage, or try again in a minute."))
     raise RewriteError(f"{brain.provider_label} answered, but not with a usable draft. Try again, "
                        "or edit by hand.")
 

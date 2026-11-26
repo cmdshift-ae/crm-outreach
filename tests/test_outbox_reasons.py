@@ -292,3 +292,18 @@ def test_a_rewrite_that_gets_no_answer_says_why(client, monkeypatch):
     r = client.post(f"/api/outbox/{items[('ops', 1)]}/rewrite", json={})
     assert r.status_code == 502
     assert "didn't answer" in r.json()["message"]
+
+
+def test_the_providers_own_error_reaches_the_reviewer(client, monkeypatch):
+    _, items = asyncio.run(_seed(client.db_path))
+
+    async def failed(self, prompt, **kw):
+        self.last_reply_empty = True
+        self.last_error = "after 3 tries: API Error: 529 overloaded"
+        return None
+
+    monkeypatch.setattr(dash, "_resolve_config_file",
+                        lambda: Path(__file__).resolve().parent.parent / "harvey.yaml")
+    monkeypatch.setattr("harvey.brain.Brain.think_json", failed)
+    r = client.post(f"/api/outbox/{items[('ops', 1)]}/rewrite", json={})
+    assert "529 overloaded" in r.json()["message"]
