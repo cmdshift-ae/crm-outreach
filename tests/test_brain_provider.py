@@ -751,3 +751,26 @@ def test_cli_status_hides_another_providers_pause(monkeypatch, tmp_path, capsys)
                       config=BrainConfig(provider="codex", model="gpt-5.5"),
                       setting=_STALE_CODEX_PAUSE)
     assert "Codex PAUSED" in out
+
+
+class _RevokedProcess:
+    returncode = 1
+
+    async def communicate(self, data=None):
+        return b"", b"Failed to authenticate: OAuth token revoked. Please log in again."
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_claude_token_stops_at_once_and_says_how_to_fix_it(state, monkeypatch):
+    calls = []
+
+    async def fake_exec(*cmd, **kwargs):
+        calls.append(cmd)
+        return _RevokedProcess()
+
+    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_exec)
+    brain = Brain(state)
+    assert await brain.think("hi") == ""
+    assert len(calls) == 1                      # no pointless retries
+    assert "claude setup-token" in brain.last_error
+    assert "OAuth token revoked" in brain.last_error

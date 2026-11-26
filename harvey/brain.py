@@ -36,7 +36,15 @@ _NON_RETRYABLE_PATTERNS = (
     "please run `claude login`",
     "invalid api key",
     "unauthorized",
+    "failed to authenticate",
+    "oauth token revoked",
+    "oauth token has expired",
+    "token has been revoked",
 )
+
+# What the reviewer is told when Claude's sign-in is gone.
+SIGNED_OUT_HINT = ("Claude is signed out. Make a new token with `claude setup-token` on your "
+                   "computer and give it to Harvey (CLAUDE_CODE_OAUTH_TOKEN), then restart Harvey")
 
 
 PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
@@ -362,7 +370,7 @@ class Brain:
                             "Non-retryable Claude error (auth). "
                             "Run 'claude login' and restart Harvey."
                         )
-                        self.last_error = f"Claude is not signed in: {error[:300]}"
+                        self.last_error = f"{SIGNED_OUT_HINT}. Claude said: {error[:200]}"
                         return ""
                     continue  # retry transient failures
 
@@ -387,6 +395,9 @@ class Brain:
                     # other transient failure.
                     logger.error(f"Claude reported an error: {response[:300]}")
                     last_error = response
+                    if any(p in str(response).lower() for p in _NON_RETRYABLE_PATTERNS):
+                        self.last_error = f"{SIGNED_OUT_HINT}. Claude said: {str(response)[:200]}"
+                        return ""
                     continue
 
                 logger.debug(f"Brain response: {response[:200]}...")
